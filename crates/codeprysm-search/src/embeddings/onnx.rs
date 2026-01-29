@@ -66,6 +66,9 @@ pub struct OnnxConfig {
     pub code_model_path: PathBuf,
     /// Execution provider to use
     pub execution_provider: ExecutionProvider,
+    /// OpenVINO device type (when using OpenVINO provider)
+    /// Examples: "CPU", "GPU", "GPU_FP32", "GPU_FP16", "NPU", "AUTO", "MULTI:NPU,GPU,CPU"
+    pub device_type: Option<String>,
     /// Device ID (for GPU providers)
     pub device_id: u32,
     /// Number of threads for CPU inference
@@ -78,6 +81,7 @@ impl Default for OnnxConfig {
             semantic_model_path: PathBuf::from("models/jina-semantic.onnx"),
             code_model_path: PathBuf::from("models/jina-code.onnx"),
             execution_provider: ExecutionProvider::Cpu,
+            device_type: Some("GPU_FP32".to_string()),
             device_id: 0,
             num_threads: None,
         }
@@ -144,6 +148,7 @@ impl OnnxProvider {
     ///
     /// Environment variables:
     /// - `CODEPRYSM_ONNX_EXECUTION_PROVIDER`: "cpu", "directml", or "openvino" (default: "cpu")
+    /// - `CODEPRYSM_ONNX_DEVICE_TYPE`: OpenVINO device type (e.g., "NPU", "GPU_FP32", "AUTO") (default: "GPU_FP32")
     /// - `CODEPRYSM_ONNX_SEMANTIC_MODEL_PATH`: Path to semantic model
     /// - `CODEPRYSM_ONNX_CODE_MODEL_PATH`: Path to code model
     /// - `CODEPRYSM_ONNX_DEVICE_ID`: Device ID for GPU providers (default: 0)
@@ -158,6 +163,10 @@ impl OnnxProvider {
                 _ => None,
             })
             .unwrap_or(ExecutionProvider::Cpu);
+
+        let device_type = std::env::var("CODEPRYSM_ONNX_DEVICE_TYPE")
+            .ok()
+            .or_else(|| Some("GPU_FP32".to_string()));
 
         let semantic_model_path =
             std::env::var("CODEPRYSM_ONNX_SEMANTIC_MODEL_PATH").unwrap_or_else(|_| {
@@ -182,6 +191,7 @@ impl OnnxProvider {
             semantic_model_path: PathBuf::from(semantic_model_path),
             code_model_path: PathBuf::from(code_model_path),
             execution_provider,
+            device_type,
             device_id,
             num_threads,
         };
@@ -403,16 +413,26 @@ fn create_session(model_path: &PathBuf, config: &OnnxConfig) -> Result<Session> 
         ExecutionProvider::OpenVino => {
             #[cfg(feature = "onnx-openvino")]
             {
+                // Determine device type from config, or use default
+                let device_type = config
+                    .device_type
+                    .as_deref()
+                    .unwrap_or("GPU_FP32");
+
                 session_builder = session_builder
                     .with_execution_providers([
                         ort::ep::OpenVINO::default()
-                            .with_device_type("GPU_FP32")
+                            .with_device_type(device_type)
                             .build()
                     ])
                     .map_err(|e| {
-                        SearchError::Embedding(format!("Failed to enable OpenVINO: {}", e))
+                        SearchError::Embedding(format!(
+                            "Failed to enable OpenVINO with device type '{}': {}",
+                            device_type, e
+                        ))
                     })?;
-                info!("Using ONNX OpenVINO execution provider");
+
+                info!("Using ONNX OpenVINO execution provider with device type: {}", device_type);
             }
             #[cfg(not(feature = "onnx-openvino"))]
             {

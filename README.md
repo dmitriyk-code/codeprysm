@@ -22,7 +22,7 @@ CodePrysm builds a comprehensive graph representation of your codebase where:
 - **Scalable Architecture** - Handles codebases with 100K+ files
 - **MCP Integration** - AI-powered code exploration via Model Context Protocol
 - **Multi-Language** - Python, JavaScript/TypeScript, C/C++, C#, Go, Rust
-- **GPU Acceleration** - Metal (macOS) and CUDA (Linux/Windows) support
+- **GPU Acceleration** - Metal (macOS), CUDA (Linux/Windows), and Intel NPU (Core Ultra+) support
 
 ## Installation
 

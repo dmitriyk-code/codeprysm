@@ -66,6 +66,7 @@ pub struct PrismConfig {
 /// semantic_model_path = "models/jina-semantic.onnx"
 /// code_model_path = "models/jina-code.onnx"
 /// execution_provider = "cpu"  # or "directml" or "openvino"
+/// device_type = "NPU"  # OpenVINO only: "CPU", "GPU", "GPU_FP32", "GPU_FP16", "NPU", "AUTO", "MULTI:GPU,CPU"
 /// ```
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(default)]
@@ -144,6 +145,25 @@ impl EmbeddingConfig {
                     return Err(ConfigError::ValidationError(
                         "embedding.onnx.code_model_path is required".to_string(),
                     ));
+                }
+                // Validate device_type if specified
+                if let Some(ref device_type) = settings.device_type {
+                    let dt = device_type.to_uppercase();
+                    let valid = dt == "CPU"
+                        || dt == "GPU"
+                        || dt == "GPU_FP32"
+                        || dt == "GPU_FP16"
+                        || dt == "NPU"
+                        || dt == "AUTO"
+                        || dt.starts_with("MULTI:");
+                    if !valid {
+                        return Err(ConfigError::ValidationError(
+                            format!(
+                                "Invalid device_type '{}'. Valid values: CPU, GPU, GPU_FP32, GPU_FP16, NPU, AUTO, MULTI:<devices>",
+                                device_type
+                            )
+                        ));
+                    }
                 }
                 Ok(())
             }
@@ -295,6 +315,9 @@ pub struct OnnxSettings {
     pub num_threads: Option<usize>,
     /// Enable optimizations
     pub enable_optimizations: bool,
+    /// OpenVINO device type (e.g., "CPU", "GPU", "GPU_FP32", "GPU_FP16", "NPU", "AUTO", "MULTI:GPU,CPU")
+    /// Only used when execution_provider = "openvino"
+    pub device_type: Option<String>,
 }
 
 impl Default for OnnxSettings {
@@ -306,6 +329,7 @@ impl Default for OnnxSettings {
             device_id: 0,
             num_threads: None, // Auto-detect
             enable_optimizations: true,
+            device_type: Some("GPU_FP32".to_string()), // Default for backward compatibility
         }
     }
 }
@@ -760,6 +784,7 @@ mod tests {
             provider: EmbeddingProviderType::AzureMl,
             azure_ml: None,
             openai: None,
+            onnx: None,
         };
         let err = config.validate().unwrap_err();
         assert!(err.to_string().contains("azure_ml"));
@@ -775,6 +800,7 @@ mod tests {
                 ..Default::default()
             }),
             openai: None,
+            onnx: None,
         };
         assert!(config.validate().is_ok());
     }
@@ -785,6 +811,7 @@ mod tests {
             provider: EmbeddingProviderType::Openai,
             azure_ml: None,
             openai: None,
+            onnx: None,
         };
         let err = config.validate().unwrap_err();
         assert!(err.to_string().contains("openai"));
@@ -800,6 +827,7 @@ mod tests {
                 semantic_model: "text-embedding-3-small".to_string(),
                 ..Default::default()
             }),
+            onnx: None,
         };
         assert!(config.validate().is_ok());
     }
@@ -832,6 +860,7 @@ mod tests {
                 max_retries: 5,
             }),
             openai: None,
+            onnx: None,
         };
 
         let toml_str = toml::to_string(&config).unwrap();
@@ -850,5 +879,70 @@ mod tests {
         );
         assert_eq!(azure_ml.code_auth_key_env, Some("MY_CODE_KEY".to_string()));
         assert_eq!(azure_ml.timeout_secs, 60);
+    }
+
+    #[test]
+    fn test_onnx_device_type_validation_valid() {
+        let valid_device_types = vec!["CPU", "GPU", "GPU_FP32", "GPU_FP16", "NPU", "AUTO", "MULTI:GPU,CPU"];
+
+        for device_type in valid_device_types {
+            let config = EmbeddingConfig {
+                provider: EmbeddingProviderType::Onnx,
+                azure_ml: None,
+                openai: None,
+                onnx: Some(OnnxSettings {
+                    semantic_model_path: PathBuf::from("semantic.onnx"),
+                    code_model_path: PathBuf::from("code.onnx"),
+                    device_type: Some(device_type.to_string()),
+                    ..Default::default()
+                }),
+            };
+            assert!(
+                config.validate().is_ok(),
+                "device_type '{}' should be valid",
+                device_type
+            );
+        }
+    }
+
+    #[test]
+    fn test_onnx_device_type_validation_invalid() {
+        let config = EmbeddingConfig {
+            provider: EmbeddingProviderType::Onnx,
+            azure_ml: None,
+            openai: None,
+            onnx: Some(OnnxSettings {
+                semantic_model_path: PathBuf::from("semantic.onnx"),
+                code_model_path: PathBuf::from("code.onnx"),
+                device_type: Some("INVALID_DEVICE".to_string()),
+                ..Default::default()
+            }),
+        };
+        let err = config.validate().unwrap_err();
+        assert!(err.to_string().contains("Invalid device_type"));
+        assert!(err.to_string().contains("INVALID_DEVICE"));
+    }
+
+    #[test]
+    fn test_onnx_device_type_validation_none() {
+        // None should be valid (uses default)
+        let config = EmbeddingConfig {
+            provider: EmbeddingProviderType::Onnx,
+            azure_ml: None,
+            openai: None,
+            onnx: Some(OnnxSettings {
+                semantic_model_path: PathBuf::from("semantic.onnx"),
+                code_model_path: PathBuf::from("code.onnx"),
+                device_type: None,
+                ..Default::default()
+            }),
+        };
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_onnx_settings_default_device_type() {
+        let settings = OnnxSettings::default();
+        assert_eq!(settings.device_type, Some("GPU_FP32".to_string()));
     }
 }

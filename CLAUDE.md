@@ -184,6 +184,85 @@ cargo test --features cuda --release
 cargo build --release
 ```
 
+### Intel NPU (AI Boost) and OpenVINO
+
+For Intel processors with NPU (Neural Processing Unit), you can use the ONNX provider with OpenVINO execution provider:
+
+**Configuration via config file** (`~/.codeprysm/config.toml`):
+
+```toml
+[embedding]
+provider = "onnx"
+
+[embedding.onnx]
+semantic_model_path = "models/jina-semantic.onnx"
+code_model_path = "models/jina-code.onnx"
+execution_provider = "openvino"
+device_type = "NPU"  # Use Intel NPU (AI Boost)
+device_id = 0
+enable_optimizations = true
+```
+
+**Configuration via environment variables**:
+
+```bash
+# Windows PowerShell
+$env:CODEPRYSM_EMBEDDING_PROVIDER="onnx"
+$env:CODEPRYSM_ONNX_EXECUTION_PROVIDER="openvino"
+$env:CODEPRYSM_ONNX_DEVICE_TYPE="NPU"
+$env:CODEPRYSM_ONNX_SEMANTIC_MODEL_PATH="models/jina-semantic.onnx"
+$env:CODEPRYSM_ONNX_CODE_MODEL_PATH="models/jina-code.onnx"
+
+# Linux/macOS
+export CODEPRYSM_EMBEDDING_PROVIDER="onnx"
+export CODEPRYSM_ONNX_EXECUTION_PROVIDER="openvino"
+export CODEPRYSM_ONNX_DEVICE_TYPE="NPU"
+export CODEPRYSM_ONNX_SEMANTIC_MODEL_PATH="models/jina-semantic.onnx"
+export CODEPRYSM_ONNX_CODE_MODEL_PATH="models/jina-code.onnx"
+```
+
+**Build with OpenVINO support**:
+
+```bash
+cargo build --features onnx-openvino --release
+```
+
+#### OpenVINO Device Types
+
+| Device Type | Description | Use Case |
+|------------|-------------|----------|
+| `CPU` | Intel CPU | Compatible with all Intel CPUs |
+| `GPU` or `GPU_FP32` | Intel GPU (FP32) | Default GPU precision, best accuracy |
+| `GPU_FP16` | Intel GPU (FP16) | Faster GPU inference, slightly less accurate |
+| `NPU` | Intel NPU (AI Boost) | Low power, efficient inference (Core Ultra+) |
+| `AUTO` | Auto-select best device | Automatically picks fastest available |
+| `MULTI:NPU,GPU,CPU` | Multi-device priority | Load balance across devices |
+
+**Requirements for Intel NPU**:
+- Intel Core Ultra (Meteor Lake or newer) with NPU/AI Boost
+- OpenVINO 2023.0 or newer
+- Updated NPU drivers from Intel
+- Windows 11 or Linux with NPU support
+
+**Examples**:
+
+```toml
+# Auto device selection (OpenVINO chooses best available)
+[embedding.onnx]
+execution_provider = "openvino"
+device_type = "AUTO"
+
+# FP16 GPU for faster inference
+[embedding.onnx]
+execution_provider = "openvino"
+device_type = "GPU_FP16"
+
+# Multi-device with priority: NPU > GPU > CPU
+[embedding.onnx]
+execution_provider = "openvino"
+device_type = "MULTI:NPU,GPU,CPU"
+```
+
 ## Performance Considerations
 
 - **Default storage location**: `.codeprysm/` directory (automatically excluded from git)

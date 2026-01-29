@@ -248,6 +248,7 @@ impl LocalBackend {
                             semantic_model_path: onnx.semantic_model_path.clone(),
                             code_model_path: onnx.code_model_path.clone(),
                             execution_provider,
+                            device_type: onnx.device_type.clone(),
                             device_id: onnx.device_id,
                             num_threads: onnx.num_threads,
                         };
