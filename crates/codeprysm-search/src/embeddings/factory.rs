@@ -32,6 +32,7 @@ pub struct EmbeddingConfig {
     /// OpenAI provider settings (used when provider = Openai)
     pub openai: Option<OpenAIConfig>,
     /// ONNX provider settings (used when provider = Onnx)
+    #[cfg(feature = "onnx")]
     pub onnx: Option<OnnxProviderConfig>,
 }
 
@@ -42,6 +43,7 @@ impl EmbeddingConfig {
             provider: EmbeddingProviderType::Local,
             azure_ml: None,
             openai: None,
+            #[cfg(feature = "onnx")]
             onnx: None,
         }
     }
@@ -52,6 +54,7 @@ impl EmbeddingConfig {
             provider: EmbeddingProviderType::AzureMl,
             azure_ml: Some(config),
             openai: None,
+            #[cfg(feature = "onnx")]
             onnx: None,
         }
     }
@@ -62,6 +65,7 @@ impl EmbeddingConfig {
             provider: EmbeddingProviderType::AzureMl,
             azure_ml: None,
             openai: None,
+            #[cfg(feature = "onnx")]
             onnx: None,
         }
     }
@@ -72,6 +76,7 @@ impl EmbeddingConfig {
             provider: EmbeddingProviderType::Openai,
             azure_ml: None,
             openai: Some(config),
+            #[cfg(feature = "onnx")]
             onnx: None,
         }
     }
@@ -82,11 +87,13 @@ impl EmbeddingConfig {
             provider: EmbeddingProviderType::Openai,
             azure_ml: None,
             openai: None,
+            #[cfg(feature = "onnx")]
             onnx: None,
         }
     }
 
     /// Create config for ONNX provider with explicit config
+    #[cfg(feature = "onnx")]
     pub fn onnx_with_config(config: OnnxProviderConfig) -> Self {
         Self {
             provider: EmbeddingProviderType::Onnx,
@@ -97,6 +104,7 @@ impl EmbeddingConfig {
     }
 
     /// Create config for ONNX provider (reads from environment)
+    #[cfg(feature = "onnx")]
     pub fn onnx() -> Self {
         Self {
             provider: EmbeddingProviderType::Onnx,

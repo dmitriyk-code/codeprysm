@@ -19,11 +19,13 @@
 //! - Build with `--features onnx-openvino` for OpenVINO support
 
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use async_trait::async_trait;
 use once_cell::sync::OnceCell;
+use ort::session::Session;
+use ort::value::Value as OrtValue;
 use tokenizers::{PaddingParams, PaddingStrategy, Tokenizer};
 use tracing::{debug, info, warn};
 
@@ -102,13 +104,13 @@ struct OnnxProviderInner {
 
 /// Loaded semantic model with ONNX Runtime
 struct SemanticModel {
-    session: ort::Session,
+    session: Mutex<Session>,
     tokenizer: Tokenizer,
 }
 
 /// Loaded code model with ONNX Runtime
 struct CodeModel {
-    session: ort::Session,
+    session: Mutex<Session>,
     tokenizer: Tokenizer,
 }
 
@@ -229,7 +231,9 @@ impl OnnxProvider {
         debug!("Encoding {} texts with ONNX semantic model", texts.len());
 
         let model_data = self.ensure_semantic_model()?;
-        encode_with_onnx(&model_data.session, &model_data.tokenizer, &texts)
+        let mut session = model_data.session.lock()
+            .map_err(|e| SearchError::Embedding(format!("Failed to lock session: {}", e)))?;
+        encode_with_onnx(&mut *session, &model_data.tokenizer, &texts)
     }
 
     /// Synchronous code encoding (internal)
@@ -242,7 +246,9 @@ impl OnnxProvider {
         debug!("Encoding {} code snippets with ONNX code model", texts.len());
 
         let model_data = self.ensure_code_model()?;
-        encode_with_onnx(&model_data.session, &model_data.tokenizer, &texts)
+        let mut session = model_data.session.lock()
+            .map_err(|e| SearchError::Embedding(format!("Failed to lock session: {}", e)))?;
+        encode_with_onnx(&mut *session, &model_data.tokenizer, &texts)
     }
 }
 
@@ -330,7 +336,10 @@ fn load_semantic_model(config: &OnnxConfig) -> Result<SemanticModel> {
     let session = create_session(&config.semantic_model_path, config)?;
     let tokenizer = load_tokenizer_for_semantic()?;
 
-    Ok(SemanticModel { session, tokenizer })
+    Ok(SemanticModel {
+        session: Mutex::new(session),
+        tokenizer
+    })
 }
 
 /// Load code model from disk
@@ -343,12 +352,15 @@ fn load_code_model(config: &OnnxConfig) -> Result<CodeModel> {
     let session = create_session(&config.code_model_path, config)?;
     let tokenizer = load_tokenizer_for_code()?;
 
-    Ok(CodeModel { session, tokenizer })
+    Ok(CodeModel {
+        session: Mutex::new(session),
+        tokenizer
+    })
 }
 
 /// Create an ONNX Runtime session with the specified execution provider
-fn create_session(model_path: &PathBuf, config: &OnnxConfig) -> Result<ort::Session> {
-    let mut session_builder = ort::Session::builder()
+fn create_session(model_path: &PathBuf, config: &OnnxConfig) -> Result<Session> {
+    let mut session_builder = Session::builder()
         .map_err(|e| SearchError::Embedding(format!("Failed to create session builder: {}", e)))?;
 
     // Configure execution provider
@@ -358,7 +370,7 @@ fn create_session(model_path: &PathBuf, config: &OnnxConfig) -> Result<ort::Sess
             {
                 if let Some(num_threads) = config.num_threads {
                     session_builder = session_builder
-                        .with_intra_threads(num_threads as i16)
+                        .with_intra_threads(num_threads)
                         .map_err(|e| {
                             SearchError::Embedding(format!("Failed to set thread count: {}", e))
                         })?;
@@ -371,10 +383,9 @@ fn create_session(model_path: &PathBuf, config: &OnnxConfig) -> Result<ort::Sess
             {
                 session_builder = session_builder
                     .with_execution_providers([
-                        ort::ExecutionProviderDispatch::DirectML(
-                            ort::DirectMLExecutionProvider::default()
-                                .with_device_id(config.device_id as i32),
-                        ),
+                        ort::ep::DirectML::default()
+                            .with_device_id(config.device_id as i32)
+                            .build()
                     ])
                     .map_err(|e| {
                         SearchError::Embedding(format!("Failed to enable DirectML: {}", e))
@@ -394,10 +405,9 @@ fn create_session(model_path: &PathBuf, config: &OnnxConfig) -> Result<ort::Sess
             {
                 session_builder = session_builder
                     .with_execution_providers([
-                        ort::ExecutionProviderDispatch::OpenVINO(
-                            ort::OpenVINOExecutionProvider::default()
-                                .with_device_type("GPU_FP32"),
-                        ),
+                        ort::ep::OpenVINO::default()
+                            .with_device_type("GPU_FP32")
+                            .build()
                     ])
                     .map_err(|e| {
                         SearchError::Embedding(format!("Failed to enable OpenVINO: {}", e))
@@ -417,66 +427,84 @@ fn create_session(model_path: &PathBuf, config: &OnnxConfig) -> Result<ort::Sess
     // Load the model
     let session = session_builder
         .commit_from_file(model_path)
-        .map_err(|e| SearchError::Embedding(format!("Failed to load ONNX model: {}", e)))?;
+        .map_err(|e| SearchError::Embedding(format!("Failed to load ONNX model from {:?}: {}", model_path, e)))?;
 
     Ok(session)
 }
 
 /// Load tokenizer for semantic model (Jina v2 base-en)
 fn load_tokenizer_for_semantic() -> Result<Tokenizer> {
-    // For now, try to load from HuggingFace Hub
-    // In production, users should bundle tokenizer.json with ONNX models
-    let tokenizer_path = "jinaai/jina-embeddings-v2-base-en";
+    // Try to load from local file first, then fall back to model directory
+    let tokenizer_paths = [
+        "models/jina-semantic-tokenizer.json",
+        "models/tokenizer.json",
+        "tokenizer.json",
+    ];
 
-    Tokenizer::from_pretrained(tokenizer_path, None)
-        .map_err(|e| {
-            SearchError::Embedding(format!(
-                "Failed to load semantic tokenizer. Please ensure tokenizer.json is available. Error: {}",
-                e
-            ))
-        })
-        .map(|mut tok| {
-            if let Some(pp) = tok.get_padding_mut() {
-                pp.strategy = PaddingStrategy::BatchLongest;
-            } else {
-                tok.with_padding(Some(PaddingParams {
-                    strategy: PaddingStrategy::BatchLongest,
-                    ..Default::default()
-                }));
-            }
-            tok
-        })
+    for path in &tokenizer_paths {
+        if std::path::Path::new(path).exists() {
+            return Tokenizer::from_file(path)
+                .map_err(|e| SearchError::Embedding(format!(
+                    "Failed to load semantic tokenizer from {}: {}",
+                    path, e
+                )))
+                .map(|mut tok| {
+                    if let Some(pp) = tok.get_padding_mut() {
+                        pp.strategy = PaddingStrategy::BatchLongest;
+                    } else {
+                        tok.with_padding(Some(PaddingParams {
+                            strategy: PaddingStrategy::BatchLongest,
+                            ..Default::default()
+                        }));
+                    }
+                    tok
+                });
+        }
+    }
+
+    Err(SearchError::Embedding(
+        "Semantic tokenizer not found. Please provide tokenizer.json file in models/ directory".to_string()
+    ))
 }
 
 /// Load tokenizer for code model (Jina v2 base-code)
 fn load_tokenizer_for_code() -> Result<Tokenizer> {
-    // For now, try to load from HuggingFace Hub
-    // In production, users should bundle tokenizer.json with ONNX models
-    let tokenizer_path = "jinaai/jina-embeddings-v2-base-code";
+    // Try to load from local file first, then fall back to model directory
+    let tokenizer_paths = [
+        "models/jina-code-tokenizer.json",
+        "models/tokenizer.json",
+        "tokenizer.json",
+    ];
 
-    Tokenizer::from_pretrained(tokenizer_path, None)
-        .map_err(|e| {
-            SearchError::Embedding(format!(
-                "Failed to load code tokenizer. Please ensure tokenizer.json is available. Error: {}",
-                e
-            ))
-        })
-        .map(|mut tok| {
-            if let Some(pp) = tok.get_padding_mut() {
-                pp.strategy = PaddingStrategy::BatchLongest;
-            } else {
-                tok.with_padding(Some(PaddingParams {
-                    strategy: PaddingStrategy::BatchLongest,
-                    ..Default::default()
-                }));
-            }
-            tok
-        })
+    for path in &tokenizer_paths {
+        if std::path::Path::new(path).exists() {
+            return Tokenizer::from_file(path)
+                .map_err(|e| SearchError::Embedding(format!(
+                    "Failed to load code tokenizer from {}: {}",
+                    path, e
+                )))
+                .map(|mut tok| {
+                    if let Some(pp) = tok.get_padding_mut() {
+                        pp.strategy = PaddingStrategy::BatchLongest;
+                    } else {
+                        tok.with_padding(Some(PaddingParams {
+                            strategy: PaddingStrategy::BatchLongest,
+                            ..Default::default()
+                        }));
+                    }
+                    tok
+                });
+        }
+    }
+
+    Err(SearchError::Embedding(
+        "Code tokenizer not found. Please provide tokenizer.json file in models/ directory".to_string()
+    ))
 }
 
 /// Encode texts using ONNX Runtime
 fn encode_with_onnx(
-    session: &ort::Session,
+    session: &mut Session,
     tokenizer: &Tokenizer,
     texts: &[&str],
 ) -> Result<Vec<Vec<f32>>> {
@@ -518,35 +546,36 @@ fn encode_with_onnx(
     let attention_mask_flat: Vec<i64> = attention_mask.into_iter().flatten().collect();
     let token_type_ids_flat: Vec<i64> = token_type_ids.into_iter().flatten().collect();
 
-    // Create ONNX input tensors
-    let input_ids_tensor = ort::inputs![
-        "input_ids" => ort::Value::from_array(
-            ([batch_size, seq_length], input_ids_flat.as_slice())
+    // Create ONNX input tensors using the ort::inputs! macro
+    let input_tensor = ort::inputs![
+        "input_ids" => OrtValue::from_array(
+            ([batch_size, seq_length], input_ids_flat)
         ).map_err(|e| SearchError::Embedding(format!("Failed to create input_ids tensor: {}", e)))?,
-        "attention_mask" => ort::Value::from_array(
-            ([batch_size, seq_length], attention_mask_flat.as_slice())
+        "attention_mask" => OrtValue::from_array(
+            ([batch_size, seq_length], attention_mask_flat)
         ).map_err(|e| SearchError::Embedding(format!("Failed to create attention_mask tensor: {}", e)))?,
-        "token_type_ids" => ort::Value::from_array(
-            ([batch_size, seq_length], token_type_ids_flat.as_slice())
+        "token_type_ids" => OrtValue::from_array(
+            ([batch_size, seq_length], token_type_ids_flat)
         ).map_err(|e| SearchError::Embedding(format!("Failed to create token_type_ids tensor: {}", e)))?
-    ]
-    .map_err(|e| SearchError::Embedding(format!("Failed to create ONNX inputs: {}", e)))?;
+    ];
 
     // Run inference
     let outputs = session
-        .run(input_ids_tensor)
+        .run(input_tensor)
         .map_err(|e| SearchError::Embedding(format!("ONNX inference failed: {}", e)))?;
 
     // Extract embeddings from output
     // Assuming the model outputs [batch_size, seq_length, hidden_size] or [batch_size, hidden_size]
+    // ONNX models usually have named outputs like "last_hidden_state" or "embeddings"
     let output_tensor = outputs
         .get("last_hidden_state")
         .or_else(|| outputs.get("embeddings"))
-        .or_else(|| outputs.get(0))
-        .ok_or_else(|| SearchError::Embedding("No output tensor found".to_string()))?;
+        .ok_or_else(|| SearchError::Embedding(
+            "No output tensor found. Expected 'last_hidden_state' or 'embeddings' output.".to_string()
+        ))?;
 
-    // Extract float data
-    let output_data: &[f32] = output_tensor
+    // Extract float data - try_extract_tensor returns (shape, data)
+    let (_shape, output_data): (&_, &[f32]) = output_tensor
         .try_extract_tensor()
         .map_err(|e| SearchError::Embedding(format!("Failed to extract output tensor: {}", e)))?;
 

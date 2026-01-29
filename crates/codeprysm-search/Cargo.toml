@@ -47,7 +47,8 @@ governor = { workspace = true, optional = true }
 
 # ONNX Runtime (optional, EXPERIMENTAL)
 # Note: 2.0.0 is still in RC as of Jan 2025
-ort = { version = "2.0.0-rc.7", optional = true, default-features = false }
+# Requires 'std' feature for file loading
+ort = { version = "2.0.0-rc.7", optional = true, default-features = false, features = ["std"] }
 
 # Serialization
 serde.workspace = true
