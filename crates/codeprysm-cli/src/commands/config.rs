@@ -29,6 +29,9 @@ pub enum ConfigCommand {
 
     /// Show configuration file paths
     Path(PathArgs),
+
+    /// Initialize configuration directory and files
+    Init(InitArgs),
 }
 
 /// Arguments for the list command
@@ -76,6 +79,37 @@ pub struct PathArgs {
     json: bool,
 }
 
+/// Arguments for the init command
+#[derive(clap::Args, Debug)]
+pub struct InitArgs {
+    /// Path to initialize (defaults to current directory)
+    #[arg(default_value = ".")]
+    path: PathBuf,
+
+    /// Force overwrite existing configuration
+    #[arg(long, short = 'f')]
+    force: bool,
+
+    /// Interactive mode - prompt for configuration options
+    #[arg(long, short = 'i')]
+    interactive: bool,
+
+    /// Configuration template to use
+    #[arg(long, value_enum, default_value = "basic")]
+    template: ConfigTemplate,
+}
+
+/// Configuration template types
+#[derive(Debug, Clone, Copy, clap::ValueEnum)]
+pub enum ConfigTemplate {
+    /// Basic template with common settings
+    Basic,
+    /// Monorepo template with include_patterns examples
+    Monorepo,
+    /// Minimal template (empty sections)
+    Minimal,
+}
+
 /// Configuration value with source information
 #[derive(Debug, Clone, Serialize)]
 pub struct ConfigValue {
@@ -107,6 +141,7 @@ pub async fn execute(cmd: ConfigCommand, global: GlobalOptions) -> Result<()> {
         ConfigCommand::Get(args) => execute_get(args, global).await,
         ConfigCommand::Set(args) => execute_set(args, global).await,
         ConfigCommand::Path(args) => execute_path(args, global).await,
+        ConfigCommand::Init(args) => execute_init(args, global).await,
     }
 }
 
@@ -234,6 +269,337 @@ async fn execute_path(args: PathArgs, global: GlobalOptions) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Execute the config init command
+async fn execute_init(args: InitArgs, global: GlobalOptions) -> Result<()> {
+    let quiet = global.quiet;
+
+    // Resolve workspace path
+    let workspace_path = if args.path.is_absolute() {
+        args.path.clone()
+    } else {
+        std::env::current_dir()?.join(&args.path)
+    };
+
+    let workspace_path = workspace_path
+        .canonicalize()
+        .context("Failed to resolve workspace path")?;
+
+    // Determine .codeprysm directory location
+    let temp_config = PrismConfig::default();
+    let prism_dir = temp_config.prism_dir(&workspace_path);
+    let config_path = prism_dir.join("config.toml");
+
+    // Check if config already exists
+    if config_path.exists() && !args.force {
+        anyhow::bail!(
+            "Configuration already exists at {}\nUse --force to overwrite",
+            config_path.display()
+        );
+    }
+
+    // Backup existing config if force overwriting
+    if config_path.exists() && args.force {
+        let backup_path = prism_dir.join("config.toml.backup");
+        std::fs::copy(&config_path, &backup_path)
+            .context("Failed to create backup")?;
+        if !quiet {
+            println!("📦 Backed up existing config to {}", backup_path.display());
+        }
+    }
+
+    // Create .codeprysm directory if needed
+    if !prism_dir.exists() {
+        std::fs::create_dir_all(&prism_dir)
+            .context("Failed to create .codeprysm directory")?;
+        if !quiet {
+            println!("📁 Created {}", prism_dir.display());
+        }
+    }
+
+    // Generate configuration content
+    let config_content = if args.interactive {
+        generate_interactive_config(&workspace_path, quiet)?
+    } else {
+        generate_template_config(args.template, &workspace_path)?
+    };
+
+    // Write configuration file
+    std::fs::write(&config_path, config_content)
+        .context("Failed to write configuration file")?;
+
+    if !quiet {
+        println!("✅ Created {}", config_path.display());
+        println!();
+        print_next_steps(&config_path, args.template);
+    }
+
+    Ok(())
+}
+
+/// Generate configuration based on template type
+fn generate_template_config(template: ConfigTemplate, workspace: &std::path::Path) -> Result<String> {
+    match template {
+        ConfigTemplate::Basic => Ok(generate_basic_template(workspace)),
+        ConfigTemplate::Monorepo => Ok(generate_monorepo_template(workspace)),
+        ConfigTemplate::Minimal => Ok(generate_minimal_template()),
+    }
+}
+
+/// Generate basic configuration template
+fn generate_basic_template(workspace: &std::path::Path) -> String {
+    let workspace_name = workspace
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("workspace");
+
+    format!(r#"# CodePrysm Local Configuration
+# Workspace: {}
+#
+# This file overrides global settings (~/.codeprysm/config.toml) for this workspace.
+# Edit this file before running 'codeprysm init' to customize analysis.
+
+[analysis]
+# Maximum file size to analyze (in KB)
+max_file_size_kb = 1024
+
+# File patterns to exclude during analysis
+# These are applied in addition to .gitignore rules
+exclude_patterns = [
+    "**/node_modules/**",
+    "**/target/**",
+    "**/.git/**",
+    "**/vendor/**",
+    "**/__pycache__/**",
+    "**/dist/**",
+    "**/build/**",
+]
+
+# File patterns to include during analysis
+# If specified, ONLY files matching these patterns will be analyzed
+# Useful for large monorepos - analyze specific packages/directories only
+#
+# Examples:
+#   include_patterns = ["packages/frontend/**", "packages/backend/**", "shared/**"]
+#   include_patterns = ["src/**", "lib/**"]
+#
+include_patterns = []
+
+# Detect and index components (package.json, Cargo.toml, etc.)
+detect_components = true
+
+# Parallel processing threads (0 = auto-detect based on CPU cores)
+parallelism = 0
+
+[storage]
+# Directory for CodePrysm data (relative to workspace root)
+prism_dir = ".codeprysm"
+
+# Enable compression for graph storage
+compression = true
+
+# Maximum partition size in MB (affects memory usage during indexing)
+max_partition_size_mb = 50
+
+# [backend.qdrant]
+# Uncomment to customize Qdrant settings for this workspace
+# url = "http://localhost:6334"
+# collection_prefix = "codeprysm"
+
+# [embedding]
+# Uncomment to use a different embedding provider for this workspace
+# provider = "local"  # Options: local, azure-ml, openai, onnx
+"#, workspace_name)
+}
+
+/// Generate monorepo-focused configuration template
+fn generate_monorepo_template(workspace: &std::path::Path) -> String {
+    let workspace_name = workspace
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("workspace");
+
+    format!(r#"# CodePrysm Local Configuration - Monorepo Template
+# Workspace: {}
+#
+# This template is optimized for large monorepos with multiple packages/projects.
+
+[analysis]
+# ⚠️ IMPORTANT: Configure include_patterns for large monorepos
+#
+# For monorepos with many packages, specify which directories to analyze.
+# This dramatically reduces analysis time and focuses search on relevant code.
+#
+# Example: Analyze only frontend and backend packages + shared utilities
+include_patterns = [
+    "packages/frontend/**",
+    "packages/backend/**",
+    "packages/shared/**",
+    # Add more packages as needed
+]
+
+# Exclude patterns (applied after include_patterns)
+exclude_patterns = [
+    "**/node_modules/**",
+    "**/target/**",
+    "**/.git/**",
+    "**/dist/**",
+    "**/build/**",
+    "**/__tests__/**",
+    "**/*.test.ts",
+    "**/*.spec.ts",
+]
+
+# Enable component detection to understand package dependencies
+detect_components = true
+
+# Increase parallelism for large repos (0 = auto)
+parallelism = 0
+
+[storage]
+prism_dir = ".codeprysm"
+compression = true
+max_partition_size_mb = 100  # Larger partitions for monorepos
+"#, workspace_name)
+}
+
+/// Generate minimal configuration template
+fn generate_minimal_template() -> String {
+    r#"# CodePrysm Local Configuration - Minimal Template
+# Only essential settings are included.
+
+[analysis]
+include_patterns = []
+exclude_patterns = []
+
+[storage]
+prism_dir = ".codeprysm"
+"#.to_string()
+}
+
+/// Generate configuration interactively by asking user questions
+fn generate_interactive_config(workspace: &std::path::Path, quiet: bool) -> Result<String> {
+    use std::io::{self, Write};
+
+    if quiet {
+        // Can't do interactive mode in quiet mode
+        return Ok(generate_basic_template(workspace));
+    }
+
+    println!("🔧 Interactive Configuration Setup");
+    println!("====================================\n");
+
+    // Question 1: Monorepo?
+    print!("Is this a monorepo with multiple packages/projects? (y/N): ");
+    io::stdout().flush()?;
+    let mut is_monorepo = String::new();
+    io::stdin().read_line(&mut is_monorepo)?;
+    let is_monorepo = is_monorepo.trim().eq_ignore_ascii_case("y");
+
+    let mut include_patterns = Vec::new();
+
+    if is_monorepo {
+        println!("\nGreat! Let's configure which packages to analyze.");
+        println!("You can add multiple patterns (one per line). Press Enter on empty line to finish.\n");
+
+        loop {
+            print!("Include pattern (e.g., 'packages/frontend/**'): ");
+            io::stdout().flush()?;
+            let mut pattern = String::new();
+            io::stdin().read_line(&mut pattern)?;
+            let pattern = pattern.trim();
+
+            if pattern.is_empty() {
+                break;
+            }
+
+            include_patterns.push(pattern.to_string());
+            println!("  ✓ Added: {}", pattern);
+        }
+
+        if include_patterns.is_empty() {
+            println!("\n⚠️  No patterns specified. Will analyze entire repository.");
+            println!("   (You can edit config.toml later to add patterns)\n");
+        }
+    }
+
+    // Question 2: Component detection?
+    print!("\nEnable component detection (Cargo.toml, package.json, etc.)? (Y/n): ");
+    io::stdout().flush()?;
+    let mut detect_components = String::new();
+    io::stdin().read_line(&mut detect_components)?;
+    let detect_components = !detect_components.trim().eq_ignore_ascii_case("n");
+
+    // Generate config based on answers
+    let workspace_name = workspace
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("workspace");
+
+    let include_patterns_str = if include_patterns.is_empty() {
+        "include_patterns = []".to_string()
+    } else {
+        let patterns = include_patterns
+            .iter()
+            .map(|p| format!("    \"{}\",", p))
+            .collect::<Vec<_>>()
+            .join("\n");
+        format!("include_patterns = [\n{}\n]", patterns)
+    };
+
+    Ok(format!(r#"# CodePrysm Local Configuration
+# Workspace: {}
+# Generated via interactive mode
+
+[analysis]
+{}
+
+exclude_patterns = [
+    "**/node_modules/**",
+    "**/target/**",
+    "**/.git/**",
+    "**/vendor/**",
+    "**/__pycache__/**",
+    "**/dist/**",
+    "**/build/**",
+]
+
+detect_components = {}
+
+[storage]
+prism_dir = ".codeprysm"
+compression = true
+"#, workspace_name, include_patterns_str, detect_components))
+}
+
+/// Print helpful next steps after config creation
+fn print_next_steps(config_path: &std::path::Path, template: ConfigTemplate) {
+    println!("📝 Configuration file created!");
+    println!();
+
+    match template {
+        ConfigTemplate::Monorepo => {
+            println!("Next steps:");
+            println!("  1. Edit {} to configure include_patterns", config_path.display());
+            println!("     (Specify which packages/directories to analyze)");
+            println!("  2. Run: codeprysm init");
+            println!();
+            println!("💡 Tip: For monorepos, include_patterns dramatically speeds up initialization");
+        }
+        ConfigTemplate::Basic => {
+            println!("Next steps:");
+            println!("  1. (Optional) Edit {} to customize settings", config_path.display());
+            println!("  2. Run: codeprysm init");
+            println!();
+            println!("💡 Tip: For large repositories, consider using include_patterns");
+        }
+        ConfigTemplate::Minimal => {
+            println!("Next steps:");
+            println!("  1. Edit {} to add configuration", config_path.display());
+            println!("  2. Run: codeprysm init");
+        }
+    }
 }
 
 /// Get a configuration value by key path
@@ -527,5 +893,80 @@ mod tests {
         let json = serde_json::to_string(&value).unwrap();
         assert!(json.contains("\"key\":\"backend.qdrant.url\""));
         assert!(json.contains("\"source\":\"default\""));
+    }
+
+    #[test]
+    fn test_generate_basic_template() {
+        use std::path::PathBuf;
+        let temp_path = PathBuf::from("/tmp/test");
+        let template = generate_basic_template(&temp_path);
+
+        assert!(template.contains("# CodePrysm Local Configuration"));
+        assert!(template.contains("[analysis]"));
+        assert!(template.contains("include_patterns = []"));
+        assert!(template.contains("exclude_patterns"));
+        assert!(template.contains("detect_components = true"));
+        assert!(template.contains("[storage]"));
+        assert!(template.contains("prism_dir = \".codeprysm\""));
+    }
+
+    #[test]
+    fn test_generate_monorepo_template() {
+        use std::path::PathBuf;
+        let temp_path = PathBuf::from("/tmp/monorepo-test");
+        let template = generate_monorepo_template(&temp_path);
+
+        assert!(template.contains("Monorepo Template"));
+        assert!(template.contains("⚠️ IMPORTANT"));
+        assert!(template.contains("include_patterns"));
+        assert!(template.contains("packages/frontend/**"));
+        assert!(template.contains("packages/backend/**"));
+        assert!(template.contains("packages/shared/**"));
+        assert!(template.contains("max_partition_size_mb = 100"));
+    }
+
+    #[test]
+    fn test_generate_minimal_template() {
+        let template = generate_minimal_template();
+
+        assert!(template.contains("Minimal Template"));
+        assert!(template.contains("[analysis]"));
+        assert!(template.contains("[storage]"));
+        assert!(template.contains("include_patterns = []"));
+        // Should be very short
+        assert!(template.len() < 500);
+    }
+
+    #[test]
+    fn test_generate_template_config_basic() {
+        use std::path::PathBuf;
+        let temp_path = PathBuf::from("/tmp/test");
+        let result = generate_template_config(ConfigTemplate::Basic, &temp_path);
+
+        assert!(result.is_ok());
+        let config = result.unwrap();
+        assert!(config.contains("Local Configuration"));
+    }
+
+    #[test]
+    fn test_generate_template_config_monorepo() {
+        use std::path::PathBuf;
+        let temp_path = PathBuf::from("/tmp/test");
+        let result = generate_template_config(ConfigTemplate::Monorepo, &temp_path);
+
+        assert!(result.is_ok());
+        let config = result.unwrap();
+        assert!(config.contains("Monorepo"));
+    }
+
+    #[test]
+    fn test_generate_template_config_minimal() {
+        use std::path::PathBuf;
+        let temp_path = PathBuf::from("/tmp/test");
+        let result = generate_template_config(ConfigTemplate::Minimal, &temp_path);
+
+        assert!(result.is_ok());
+        let config = result.unwrap();
+        assert!(config.contains("Minimal"));
     }
 }

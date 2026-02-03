@@ -54,6 +54,28 @@ just rust-lint
 just rust-fmt
 ```
 
+### Configuration Commands
+
+For large repositories or monorepos, create configuration **before** running init:
+
+```bash
+# Create configuration directory and template
+just config-init [dir]
+
+# Create with monorepo template (includes include_patterns examples)
+just config-init-monorepo [dir]
+
+# Interactive mode (asks questions)
+just config-init-interactive [dir]
+
+# After creating config, edit .codeprysm/config.toml to set include_patterns:
+# [analysis]
+# include_patterns = ["packages/frontend/**", "packages/backend/**"]
+
+# Then run init (uses configured include_patterns)
+just init [dir]
+```
+
 ### Graph Commands
 
 ```bash
@@ -115,6 +137,26 @@ just qdrant-status
 3. Start Qdrant: `just qdrant-start`
 4. Initialize graph: `just init`
 5. Start MCP server: `just mcp`
+
+### First-Time Setup for Large Repositories
+
+For large monorepos or repositories where you only want to analyze specific directories:
+
+1. Create configuration first: `just config-init` (or `just config-init-monorepo`)
+2. Edit `.codeprysm/config.toml` to set `include_patterns`
+3. Initialize graph: `just init`
+
+**Example config for monorepo:**
+```toml
+[analysis]
+include_patterns = [
+    "packages/frontend/**",
+    "packages/backend/**",
+    "shared/**"
+]
+```
+
+This dramatically reduces initialization time for large repositories.
 
 ### Rust Development
 
