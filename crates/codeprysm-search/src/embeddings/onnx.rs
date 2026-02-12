@@ -137,21 +137,10 @@ struct CodeModel {
 
 impl OnnxProvider {
     /// Create a new ONNX provider with the given configuration
+    ///
+    /// Models will be downloaded from HuggingFace Hub on first use if not found locally.
     pub fn new(config: OnnxConfig) -> Result<Self> {
-        // Validate paths exist
-        if !config.semantic_model_path.exists() {
-            return Err(SearchError::Embedding(format!(
-                "Semantic model not found: {}",
-                config.semantic_model_path.display()
-            )));
-        }
-        if !config.code_model_path.exists() {
-            return Err(SearchError::Embedding(format!(
-                "Code model not found: {}",
-                config.code_model_path.display()
-            )));
-        }
-
+        // Don't validate paths here - models will be downloaded lazily on first use
         Ok(Self {
             inner: Arc::new(OnnxProviderInner {
                 semantic_model: OnceCell::new(),
@@ -394,14 +383,35 @@ fn download_tokenizer(model_id: &str) -> Result<PathBuf> {
         .map_err(|e| SearchError::Embedding(format!("Failed to download tokenizer.json: {}", e)))
 }
 
-/// Load semantic model from disk
+/// Load semantic model from disk or download from HuggingFace Hub
 fn load_semantic_model(config: &OnnxConfig) -> Result<SemanticModel> {
-    info!(
-        "Loading ONNX semantic model from {}",
-        config.semantic_model_path.display()
-    );
+    // Check if model exists at configured path
+    let model_path = if config.semantic_model_path.exists() {
+        info!(
+            "Loading ONNX semantic model from {}",
+            config.semantic_model_path.display()
+        );
+        config.semantic_model_path.clone()
+    } else {
+        // Try to download from HuggingFace Hub
+        info!(
+            "Semantic model not found at {}, downloading from HuggingFace Hub...",
+            config.semantic_model_path.display()
+        );
+        let downloaded_path = download_onnx_model(CODE_MODEL_ID, "onnx/model.onnx")
+            .map_err(|e| {
+                SearchError::Embedding(format!(
+                    "Failed to load semantic model from {} and download from HuggingFace failed: {}",
+                    config.semantic_model_path.display(),
+                    e
+                ))
+            })?;
+        info!("Downloaded semantic model to: {}", downloaded_path.display());
+        downloaded_path
+    };
 
-    let session = create_session(&config.semantic_model_path, config)?;
+    info!("Creating ONNX session from: {}", model_path.display());
+    let session = create_session(&model_path, config)?;
     let tokenizer = load_tokenizer_for_semantic()?;
 
     Ok(SemanticModel {
@@ -410,14 +420,35 @@ fn load_semantic_model(config: &OnnxConfig) -> Result<SemanticModel> {
     })
 }
 
-/// Load code model from disk
+/// Load code model from disk or download from HuggingFace Hub
 fn load_code_model(config: &OnnxConfig) -> Result<CodeModel> {
-    info!(
-        "Loading ONNX code model from {}",
-        config.code_model_path.display()
-    );
+    // Check if model exists at configured path
+    let model_path = if config.code_model_path.exists() {
+        info!(
+            "Loading ONNX code model from {}",
+            config.code_model_path.display()
+        );
+        config.code_model_path.clone()
+    } else {
+        // Try to download from HuggingFace Hub
+        info!(
+            "Code model not found at {}, downloading from HuggingFace Hub...",
+            config.code_model_path.display()
+        );
+        let downloaded_path = download_onnx_model(CODE_MODEL_ID, "onnx/model.onnx")
+            .map_err(|e| {
+                SearchError::Embedding(format!(
+                    "Failed to load code model from {} and download from HuggingFace failed: {}",
+                    config.code_model_path.display(),
+                    e
+                ))
+            })?;
+        info!("Downloaded code model to: {}", downloaded_path.display());
+        downloaded_path
+    };
 
-    let session = create_session(&config.code_model_path, config)?;
+    info!("Creating ONNX session from: {}", model_path.display());
+    let session = create_session(&model_path, config)?;
     let tokenizer = load_tokenizer_for_code()?;
 
     Ok(CodeModel {
@@ -501,9 +532,11 @@ fn create_session(model_path: &PathBuf, config: &OnnxConfig) -> Result<Session> 
 }
 
 /// Load tokenizer for semantic model (Jina v2 base-en)
+/// NOTE: Currently using CODE_MODEL_ID because semantic model doesn't have ONNX format
 fn load_tokenizer_for_semantic() -> Result<Tokenizer> {
     // Try to load from HuggingFace Hub first
-    if let Ok(tokenizer_path) = download_tokenizer(SEMANTIC_MODEL_ID) {
+    // Using CODE_MODEL_ID because we use the code model for both semantic and code
+    if let Ok(tokenizer_path) = download_tokenizer(CODE_MODEL_ID) {
         debug!("Using tokenizer from HF Hub: {}", tokenizer_path.display());
         return load_tokenizer_from_path(&tokenizer_path);
     }
@@ -511,7 +544,7 @@ fn load_tokenizer_for_semantic() -> Result<Tokenizer> {
     // Fall back to local files
     warn!("Failed to download tokenizer from HF Hub, trying local files...");
     let tokenizer_paths = [
-        "models/jina-semantic-tokenizer.json",
+        "models/jina-code-tokenizer.json",
         "models/tokenizer.json",
         "tokenizer.json",
     ];
@@ -605,35 +638,22 @@ fn encode_with_onnx(
         .map(|enc| enc.get_attention_mask().iter().map(|&m| m as i64).collect())
         .collect();
 
-    let token_type_ids: Vec<Vec<i64>> = encodings
-        .iter()
-        .map(|enc| {
-            enc.get_type_ids()
-                .iter()
-                .map(|&t| t as i64)
-                .collect()
-        })
-        .collect();
-
     // Flatten for ONNX input
     let batch_size = input_ids.len();
     let seq_length = input_ids[0].len();
 
     let input_ids_flat: Vec<i64> = input_ids.into_iter().flatten().collect();
     let attention_mask_flat: Vec<i64> = attention_mask.into_iter().flatten().collect();
-    let token_type_ids_flat: Vec<i64> = token_type_ids.into_iter().flatten().collect();
 
-    // Create ONNX input tensors using the ort::inputs! macro
+    // Create ONNX input tensors - only input_ids and attention_mask (no token_type_ids)
+    // Jina models don't use token_type_ids
     let input_tensor = ort::inputs![
         "input_ids" => OrtValue::from_array(
             ([batch_size, seq_length], input_ids_flat)
         ).map_err(|e| SearchError::Embedding(format!("Failed to create input_ids tensor: {}", e)))?,
         "attention_mask" => OrtValue::from_array(
             ([batch_size, seq_length], attention_mask_flat)
-        ).map_err(|e| SearchError::Embedding(format!("Failed to create attention_mask tensor: {}", e)))?,
-        "token_type_ids" => OrtValue::from_array(
-            ([batch_size, seq_length], token_type_ids_flat)
-        ).map_err(|e| SearchError::Embedding(format!("Failed to create token_type_ids tensor: {}", e)))?
+        ).map_err(|e| SearchError::Embedding(format!("Failed to create attention_mask tensor: {}", e)))?
     ];
 
     // Run inference
