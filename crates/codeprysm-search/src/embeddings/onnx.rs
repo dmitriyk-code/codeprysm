@@ -645,6 +645,9 @@ fn encode_with_onnx(
     let input_ids_flat: Vec<i64> = input_ids.into_iter().flatten().collect();
     let attention_mask_flat: Vec<i64> = attention_mask.into_iter().flatten().collect();
 
+    // Keep attention mask as f32 for pooling calculations
+    let attention_mask_f32: Vec<f32> = attention_mask_flat.iter().map(|&x| x as f32).collect();
+
     // Create ONNX input tensors - only input_ids and attention_mask (no token_type_ids)
     // Jina models don't use token_type_ids
     let input_tensor = ort::inputs![
@@ -661,9 +664,7 @@ fn encode_with_onnx(
         .run(input_tensor)
         .map_err(|e| SearchError::Embedding(format!("ONNX inference failed: {}", e)))?;
 
-    // Extract embeddings from output
-    // Assuming the model outputs [batch_size, seq_length, hidden_size] or [batch_size, hidden_size]
-    // ONNX models usually have named outputs like "last_hidden_state" or "embeddings"
+    // Extract embeddings from output - should be [batch_size, seq_length, hidden_dim]
     let output_tensor = outputs
         .get("last_hidden_state")
         .or_else(|| outputs.get("embeddings"))
@@ -671,25 +672,85 @@ fn encode_with_onnx(
             "No output tensor found. Expected 'last_hidden_state' or 'embeddings' output.".to_string()
         ))?;
 
-    // Extract float data - try_extract_tensor returns (shape, data)
-    let (_shape, output_data): (&_, &[f32]) = output_tensor
+    // Get shape and data
+    let (shape, output_data): (_, &[f32]) = output_tensor
         .try_extract_tensor()
         .map_err(|e| SearchError::Embedding(format!("Failed to extract output tensor: {}", e)))?;
 
-    // Reshape to [batch_size, EMBEDDING_DIM]
-    // For BERT models, we typically take the [CLS] token embedding (first token)
-    let mut embeddings = Vec::with_capacity(batch_size);
-    for i in 0..batch_size {
-        let start_idx = i * EMBEDDING_DIM;
-        let end_idx = start_idx + EMBEDDING_DIM;
-        let embedding = output_data[start_idx..end_idx].to_vec();
+    // Convert shape to slice
+    let shape_dims = shape.as_ref();
 
-        // Normalize embedding
-        let norm: f32 = embedding.iter().map(|x| x * x).sum::<f32>().sqrt();
+    // Verify shape: [batch_size, seq_length, hidden_dim]
+    if shape_dims.len() != 3 {
+        return Err(SearchError::Embedding(format!(
+            "Expected 3D output tensor [batch_size, seq_length, hidden_dim], got shape: {:?}",
+            shape_dims
+        )));
+    }
+
+    let batch_size_out = shape_dims[0] as usize;
+    let seq_length_out = shape_dims[1] as usize;
+    let hidden_dim = shape_dims[2] as usize;
+
+    if batch_size_out != batch_size {
+        return Err(SearchError::Embedding(format!(
+            "Batch size mismatch: expected {}, got {}",
+            batch_size, batch_size_out
+        )));
+    }
+
+    if seq_length_out != seq_length {
+        return Err(SearchError::Embedding(format!(
+            "Sequence length mismatch: expected {}, got {}",
+            seq_length, seq_length_out
+        )));
+    }
+
+    if hidden_dim != EMBEDDING_DIM {
+        return Err(SearchError::Embedding(format!(
+            "Hidden dimension mismatch: expected {}, got {}",
+            EMBEDDING_DIM, hidden_dim
+        )));
+    }
+
+    // Apply mean pooling with attention mask (matching Candle's approach)
+    // This replicates the mean_pool() function from local.rs:
+    // - Mask out padding tokens using attention_mask
+    // - Average non-padding token embeddings across sequence length
+    let mut embeddings = Vec::with_capacity(batch_size);
+
+    for i in 0..batch_size {
+        // Get this sequence's embeddings: [seq_length, hidden_dim]
+        let seq_start = i * seq_length * hidden_dim;
+
+        // Calculate mean pooling with attention mask
+        let mut sum = vec![0.0f32; hidden_dim];
+        let mut mask_sum = 0.0f32;
+
+        for j in 0..seq_length {
+            let mask_val = attention_mask_f32[i * seq_length + j];
+            if mask_val > 0.0 {
+                let token_start = seq_start + j * hidden_dim;
+                for k in 0..hidden_dim {
+                    sum[k] += output_data[token_start + k] * mask_val;
+                }
+                mask_sum += mask_val;
+            }
+        }
+
+        // Average by dividing by sum of mask values
+        if mask_sum > 0.0 {
+            for val in &mut sum {
+                *val /= mask_sum;
+            }
+        }
+
+        // L2 normalization (matching normalize_l2() from local.rs)
+        let norm: f32 = sum.iter().map(|x| x * x).sum::<f32>().sqrt();
         let normalized: Vec<f32> = if norm > 0.0 {
-            embedding.iter().map(|x| x / norm).collect()
+            sum.iter().map(|x| x / norm).collect()
         } else {
-            embedding
+            sum
         };
 
         embeddings.push(normalized);
