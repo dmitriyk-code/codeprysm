@@ -133,3 +133,10 @@ target/
 
 # Old fastembed cache (superseded by candle, uses ~/.cache/huggingface/hub/)
 .fastembed_cache/
+
+# Model files (downloaded at runtime to ~/.cache/huggingface/hub/)
+models/
+
+# ONNX Runtime files (downloaded by ort crate)
+onnxruntime_extracted/
+*.whl

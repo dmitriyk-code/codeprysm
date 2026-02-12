@@ -13,7 +13,7 @@
 //!
 //! # Requirements
 //!
-//! - ONNX models must be exported manually (not auto-downloaded)
+//! - ONNX models are auto-downloaded from HuggingFace Hub to `~/.cache/huggingface/hub/`
 //! - Build with `--features onnx` for CPU support
 //! - Build with `--features onnx-directml` for DirectML support (Windows)
 //! - Build with `--features onnx-openvino` for OpenVINO support
@@ -23,6 +23,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use async_trait::async_trait;
+use hf_hub::{api::sync::Api, Repo, RepoType};
 use once_cell::sync::OnceCell;
 use ort::session::Session;
 use ort::value::Value as OrtValue;
@@ -35,6 +36,12 @@ use super::provider::{EmbeddingProvider, EmbeddingProviderType, ProviderStatus};
 
 /// Unified embedding dimension (both models output 768-dim)
 pub const EMBEDDING_DIM: usize = 768;
+
+/// Semantic model on HuggingFace Hub
+const SEMANTIC_MODEL_ID: &str = "jinaai/jina-embeddings-v2-base-en";
+
+/// Code model on HuggingFace Hub
+const CODE_MODEL_ID: &str = "jinaai/jina-embeddings-v2-base-code";
 
 /// ONNX Runtime execution provider
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -74,9 +81,23 @@ pub struct OnnxConfig {
 
 impl Default for OnnxConfig {
     fn default() -> Self {
+        // Try to get models from HuggingFace cache or download
+        // Falls back to local models/ directory if HF download fails
+        let semantic_model_path = download_onnx_model_if_available(
+            SEMANTIC_MODEL_ID,
+            "onnx/model.onnx",
+        )
+        .unwrap_or_else(|| PathBuf::from("models/jina-semantic.onnx"));
+
+        let code_model_path = download_onnx_model_if_available(
+            CODE_MODEL_ID,
+            "onnx/model.onnx",
+        )
+        .unwrap_or_else(|| PathBuf::from("models/jina-code.onnx"));
+
         Self {
-            semantic_model_path: PathBuf::from("models/jina-semantic.onnx"),
-            code_model_path: PathBuf::from("models/jina-code.onnx"),
+            semantic_model_path,
+            code_model_path,
             execution_provider: ExecutionProvider::Cpu,
             device_id: 0,
             num_threads: None,
@@ -326,6 +347,53 @@ impl EmbeddingProvider for OnnxProvider {
 // Helper functions
 // ============================================================================
 
+/// Download ONNX model from HuggingFace Hub if available
+///
+/// Downloads ONNX model file to `~/.cache/huggingface/hub/`. Returns None if
+/// download fails (e.g., network issues, model not found).
+fn download_onnx_model_if_available(model_id: &str, filename: &str) -> Option<PathBuf> {
+    match download_onnx_model(model_id, filename) {
+        Ok(path) => {
+            info!("Downloaded ONNX model from HF Hub: {}", path.display());
+            Some(path)
+        }
+        Err(e) => {
+            warn!(
+                "Failed to download ONNX model {} from HF Hub: {}. Will try local models/ directory.",
+                model_id, e
+            );
+            None
+        }
+    }
+}
+
+/// Download ONNX model file from HuggingFace Hub
+fn download_onnx_model(model_id: &str, filename: &str) -> Result<PathBuf> {
+    let api = Api::new()
+        .map_err(|e| SearchError::Embedding(format!("Failed to create HF API: {}", e)))?;
+
+    let repo = Repo::with_revision(model_id.to_string(), RepoType::Model, "main".to_string());
+    let api_repo = api.repo(repo);
+
+    // Downloads to ~/.cache/huggingface/hub/models--{org}--{model}/snapshots/{hash}/
+    api_repo
+        .get(filename)
+        .map_err(|e| SearchError::Embedding(format!("Failed to download {}: {}", filename, e)))
+}
+
+/// Download tokenizer from HuggingFace Hub
+fn download_tokenizer(model_id: &str) -> Result<PathBuf> {
+    let api = Api::new()
+        .map_err(|e| SearchError::Embedding(format!("Failed to create HF API: {}", e)))?;
+
+    let repo = Repo::with_revision(model_id.to_string(), RepoType::Model, "main".to_string());
+    let api_repo = api.repo(repo);
+
+    api_repo
+        .get("tokenizer.json")
+        .map_err(|e| SearchError::Embedding(format!("Failed to download tokenizer.json: {}", e)))
+}
+
 /// Load semantic model from disk
 fn load_semantic_model(config: &OnnxConfig) -> Result<SemanticModel> {
     info!(
@@ -434,7 +502,14 @@ fn create_session(model_path: &PathBuf, config: &OnnxConfig) -> Result<Session> 
 
 /// Load tokenizer for semantic model (Jina v2 base-en)
 fn load_tokenizer_for_semantic() -> Result<Tokenizer> {
-    // Try to load from local file first, then fall back to model directory
+    // Try to load from HuggingFace Hub first
+    if let Ok(tokenizer_path) = download_tokenizer(SEMANTIC_MODEL_ID) {
+        debug!("Using tokenizer from HF Hub: {}", tokenizer_path.display());
+        return load_tokenizer_from_path(&tokenizer_path);
+    }
+
+    // Fall back to local files
+    warn!("Failed to download tokenizer from HF Hub, trying local files...");
     let tokenizer_paths = [
         "models/jina-semantic-tokenizer.json",
         "models/tokenizer.json",
@@ -443,33 +518,26 @@ fn load_tokenizer_for_semantic() -> Result<Tokenizer> {
 
     for path in &tokenizer_paths {
         if std::path::Path::new(path).exists() {
-            return Tokenizer::from_file(path)
-                .map_err(|e| SearchError::Embedding(format!(
-                    "Failed to load semantic tokenizer from {}: {}",
-                    path, e
-                )))
-                .map(|mut tok| {
-                    if let Some(pp) = tok.get_padding_mut() {
-                        pp.strategy = PaddingStrategy::BatchLongest;
-                    } else {
-                        tok.with_padding(Some(PaddingParams {
-                            strategy: PaddingStrategy::BatchLongest,
-                            ..Default::default()
-                        }));
-                    }
-                    tok
-                });
+            debug!("Using local tokenizer: {}", path);
+            return load_tokenizer_from_path(&PathBuf::from(path));
         }
     }
 
     Err(SearchError::Embedding(
-        "Semantic tokenizer not found. Please provide tokenizer.json file in models/ directory".to_string()
+        "Semantic tokenizer not found. Please provide tokenizer.json file in models/ directory or ensure network access to HuggingFace Hub".to_string()
     ))
 }
 
 /// Load tokenizer for code model (Jina v2 base-code)
 fn load_tokenizer_for_code() -> Result<Tokenizer> {
-    // Try to load from local file first, then fall back to model directory
+    // Try to load from HuggingFace Hub first
+    if let Ok(tokenizer_path) = download_tokenizer(CODE_MODEL_ID) {
+        debug!("Using tokenizer from HF Hub: {}", tokenizer_path.display());
+        return load_tokenizer_from_path(&tokenizer_path);
+    }
+
+    // Fall back to local files
+    warn!("Failed to download tokenizer from HF Hub, trying local files...");
     let tokenizer_paths = [
         "models/jina-code-tokenizer.json",
         "models/tokenizer.json",
@@ -478,28 +546,37 @@ fn load_tokenizer_for_code() -> Result<Tokenizer> {
 
     for path in &tokenizer_paths {
         if std::path::Path::new(path).exists() {
-            return Tokenizer::from_file(path)
-                .map_err(|e| SearchError::Embedding(format!(
-                    "Failed to load code tokenizer from {}: {}",
-                    path, e
-                )))
-                .map(|mut tok| {
-                    if let Some(pp) = tok.get_padding_mut() {
-                        pp.strategy = PaddingStrategy::BatchLongest;
-                    } else {
-                        tok.with_padding(Some(PaddingParams {
-                            strategy: PaddingStrategy::BatchLongest,
-                            ..Default::default()
-                        }));
-                    }
-                    tok
-                });
+            debug!("Using local tokenizer: {}", path);
+            return load_tokenizer_from_path(&PathBuf::from(path));
         }
     }
 
     Err(SearchError::Embedding(
-        "Code tokenizer not found. Please provide tokenizer.json file in models/ directory".to_string()
+        "Code tokenizer not found. Please provide tokenizer.json file in models/ directory or ensure network access to HuggingFace Hub".to_string()
     ))
+}
+
+/// Load tokenizer from a file path and configure padding
+fn load_tokenizer_from_path(path: &PathBuf) -> Result<Tokenizer> {
+    Tokenizer::from_file(path)
+        .map_err(|e| {
+            SearchError::Embedding(format!(
+                "Failed to load tokenizer from {}: {}",
+                path.display(),
+                e
+            ))
+        })
+        .map(|mut tok| {
+            if let Some(pp) = tok.get_padding_mut() {
+                pp.strategy = PaddingStrategy::BatchLongest;
+            } else {
+                tok.with_padding(Some(PaddingParams {
+                    strategy: PaddingStrategy::BatchLongest,
+                    ..Default::default()
+                }));
+            }
+            tok
+        })
 }
 
 /// Encode texts using ONNX Runtime
