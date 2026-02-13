@@ -18,6 +18,7 @@ use std::path::{Path, PathBuf};
 
 use encoding_rs::{UTF_16BE, UTF_16LE, UTF_8, WINDOWS_1252};
 use ignore::WalkBuilder;
+use rayon::prelude::*;
 use thiserror::Error;
 use tracing::{debug, info, warn};
 
@@ -56,6 +57,10 @@ pub enum BuilderError {
     /// No supported files found
     #[error("No supported files found in directory: {0}")]
     NoFilesFound(PathBuf),
+
+    /// Unsupported language
+    #[error("Unsupported language")]
+    UnsupportedLanguage,
 }
 
 // ============================================================================
@@ -154,6 +159,43 @@ struct ReferenceInfo {
 }
 
 // ============================================================================
+// File Processing Result
+// ============================================================================
+
+/// Results from processing a single file in parallel.
+#[derive(Debug, Clone)]
+struct FileProcessingResult {
+    /// File path (relative to repository)
+    rel_path: String,
+    /// Nodes extracted from this file
+    nodes: Vec<Node>,
+    /// Edges from this file (CONTAINS and DEFINES only)
+    edges: Vec<Edge>,
+    /// Definitions found in this file (name -> node_id)
+    definitions: HashMap<String, String>,
+    /// References found in this file (name -> reference info)
+    references: HashMap<String, Vec<ReferenceInfo>>,
+    /// Number of Data nodes skipped (if skip_data_nodes enabled)
+    skipped_data_nodes: usize,
+    /// Number of nodes skipped due to depth limit
+    skipped_depth_nodes: usize,
+}
+
+impl FileProcessingResult {
+    fn new(rel_path: String) -> Self {
+        Self {
+            rel_path,
+            nodes: Vec::new(),
+            edges: Vec::new(),
+            definitions: HashMap::new(),
+            references: HashMap::new(),
+            skipped_data_nodes: 0,
+            skipped_depth_nodes: 0,
+        }
+    }
+}
+
+// ============================================================================
 // Graph Builder
 // ============================================================================
 
@@ -239,9 +281,26 @@ impl GraphBuilder {
         })
     }
 
+    /// Write status update to a file in the .codeprysm directory
+    fn write_status(&self, directory: &Path, step: &str, message: &str) -> std::io::Result<()> {
+        let status_dir = directory.join(".codeprysm").join("status");
+        std::fs::create_dir_all(&status_dir)?;
+
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        let filename = format!("{}_{}.txt", timestamp, step.replace(' ', "_"));
+        let status_file = status_dir.join(filename);
+
+        std::fs::write(status_file, format!("{}: {}\n", step, message))?;
+        Ok(())
+    }
+
     /// Build a code graph from a directory.
     ///
-    /// Walks the directory, processes all supported source files, and
+    /// Walks the directory, processes all supported source files in parallel, and
     /// constructs a code graph with nodes and edges.
     ///
     /// # Arguments
@@ -263,15 +322,7 @@ impl GraphBuilder {
         graph.add_node(repo_node);
 
         info!("Created repository node: {}", repo_name);
-
-        // Track definitions and references for later resolution
-        let mut defines: HashMap<String, String> = HashMap::new();
-        let mut references: HashMap<String, Vec<ReferenceInfo>> = HashMap::new();
-
-        // Statistics
-        let mut file_count = 0;
-        let mut skipped_data_nodes = 0;
-        let mut skipped_depth_nodes = 0;
+        let _ = self.write_status(directory, "step_1_repo_created", &format!("Repository node: {}", repo_name));
 
         info!("Processing files in {}", directory.display());
 
@@ -282,52 +333,132 @@ impl GraphBuilder {
             return Err(BuilderError::NoFilesFound(directory.to_path_buf()));
         }
 
-        info!("Found {} files to process", files.len());
+        // Apply max_files limit before parallel processing
+        let files_to_process: Vec<PathBuf> = if let Some(max) = self.config.max_files {
+            files.into_iter().take(max).collect()
+        } else {
+            files
+        };
 
-        // Process each file
-        for file_path in files {
-            // Check max files limit
-            if let Some(max) = self.config.max_files {
-                if file_count >= max {
-                    info!("Reached maximum file limit of {}", max);
-                    break;
-                }
-            }
+        info!("Found {} files to process", files_to_process.len());
+        let _ = self.write_status(
+            directory,
+            "step_2_files_collected",
+            &format!("Files to process: {}", files_to_process.len())
+        );
 
-            // Get relative path
-            let rel_path = file_path
-                .strip_prefix(directory)
-                .unwrap_or(&file_path)
-                .to_string_lossy()
-                .to_string();
+        // Process files in parallel
+        info!("Processing files in parallel...");
+        let start_time = std::time::Instant::now();
 
-            // Process the file
-            match self.process_file(
-                &file_path,
-                &rel_path,
-                &repo_name,
-                &mut graph,
-                &mut defines,
-                &mut references,
-                &mut skipped_data_nodes,
-                &mut skipped_depth_nodes,
-            ) {
-                Ok(_) => {
-                    file_count += 1;
-                    if file_count % 100 == 0 {
-                        debug!("Processed {} files", file_count);
+        let results: Vec<FileProcessingResult> = files_to_process
+            .par_iter()
+            .filter_map(|file_path| {
+                // Get relative path
+                let rel_path = file_path
+                    .strip_prefix(directory)
+                    .unwrap_or(file_path)
+                    .to_string_lossy()
+                    .to_string();
+
+                match self.process_file_parallel(file_path, &rel_path, &repo_name) {
+                    Ok(result) => Some(result),
+                    Err(e) => {
+                        warn!("Error processing {}: {}", rel_path, e);
+                        None
                     }
                 }
-                Err(e) => {
-                    warn!("Error processing {}: {}", rel_path, e);
-                }
+            })
+            .collect();
+
+        let processing_time = start_time.elapsed();
+        info!(
+            "Parallel processing complete: {} files in {:.2}s ({:.1} files/sec)",
+            results.len(),
+            processing_time.as_secs_f64(),
+            results.len() as f64 / processing_time.as_secs_f64()
+        );
+        let _ = self.write_status(
+            directory,
+            "step_3_parallel_processing",
+            &format!(
+                "Processed {} files in {:.2}s ({:.1} files/sec)",
+                results.len(),
+                processing_time.as_secs_f64(),
+                results.len() as f64 / processing_time.as_secs_f64()
+            )
+        );
+
+        // Merge results into main graph
+        info!("Merging results into graph...");
+        let merge_start = std::time::Instant::now();
+
+        let mut defines: HashMap<String, String> = HashMap::new();
+        let mut references: HashMap<String, Vec<ReferenceInfo>> = HashMap::new();
+        let mut file_count = 0;
+        let mut skipped_data_nodes = 0;
+        let mut skipped_depth_nodes = 0;
+
+        for result in results {
+            // Add all nodes from this file
+            for node in result.nodes {
+                graph.add_node(node);
+            }
+
+            // Add all edges from this file
+            for edge in result.edges {
+                graph.add_edge_from_struct(&edge);
+            }
+
+            // Merge definitions
+            defines.extend(result.definitions);
+
+            // Merge references
+            for (name, refs) in result.references {
+                references.entry(name).or_default().extend(refs);
+            }
+
+            // Accumulate statistics
+            skipped_data_nodes += result.skipped_data_nodes;
+            skipped_depth_nodes += result.skipped_depth_nodes;
+            file_count += 1;
+
+            // Progress logging
+            if file_count % 100 == 0 {
+                debug!("Merged {} files", file_count);
             }
         }
 
-        info!("Processed {} files", file_count);
+        let merge_time = merge_start.elapsed();
+        info!(
+            "Merge complete: {} files in {:.2}s",
+            file_count,
+            merge_time.as_secs_f64()
+        );
+        let _ = self.write_status(
+            directory,
+            "step_4_merge_complete",
+            &format!(
+                "Merged {} files with {} definitions, {} references in {:.2}s",
+                file_count,
+                defines.len(),
+                references.len(),
+                merge_time.as_secs_f64()
+            )
+        );
 
         // Resolve references and create USES edges
+        info!("Resolving references...");
+        let resolve_start = std::time::Instant::now();
         self.resolve_references(&mut graph, &defines, &references);
+        let resolve_time = resolve_start.elapsed();
+
+        info!("Reference resolution complete in {:.2}s", resolve_time.as_secs_f64());
+        let _ = self.write_status(
+            directory,
+            "step_5_references_resolved",
+            &format!("Resolved references in {:.2}s", resolve_time.as_secs_f64())
+        );
 
         // Log statistics
         let contains_count = graph.edges_by_type(EdgeType::Contains).count();
@@ -350,6 +481,17 @@ impl GraphBuilder {
                 info!("  - Skipped nodes (max depth): {}", skipped_depth_nodes);
             }
         }
+
+        let total_time = start_time.elapsed();
+        let final_summary = format!(
+            "Graph complete: {} nodes, {} edges, {} files in {:.2}s",
+            graph.node_count(),
+            graph.edge_count(),
+            file_count,
+            total_time.as_secs_f64()
+        );
+        info!("{}", final_summary);
+        let _ = self.write_status(directory, "step_6_complete", &final_summary);
 
         Ok(graph)
     }
@@ -575,6 +717,200 @@ impl GraphBuilder {
         builder
             .build()
             .unwrap_or_else(|_| globset::GlobSet::empty())
+    }
+
+    /// Process a single file in parallel and return results without mutating shared state.
+    ///
+    /// This method is thread-safe and returns all extracted entities and relationships
+    /// for later merging into the main graph.
+    fn process_file_parallel(
+        &self,
+        file_path: &Path,
+        rel_path: &str,
+        repo_name: &str,
+    ) -> Result<FileProcessingResult, BuilderError> {
+        // Detect language
+        let language = match SupportedLanguage::from_path(file_path) {
+            Some(lang) => lang,
+            None => return Err(BuilderError::UnsupportedLanguage),
+        };
+
+        // Read file content (with encoding detection for non-UTF-8 files)
+        let source = read_file_with_encoding(file_path)?;
+
+        // Compute file hash
+        let file_hash = compute_file_hash(file_path)?;
+
+        // Count lines
+        let line_count = source.lines().count();
+
+        // Create result container
+        let mut result = FileProcessingResult::new(rel_path.to_string());
+
+        // Add file container node
+        result.nodes.push(Node::source_file(
+            rel_path.to_string(),
+            rel_path.to_string(),
+            file_hash,
+            line_count,
+        ));
+
+        // Add CONTAINS edge from Repository to File (if we have a repo context)
+        if !repo_name.is_empty() {
+            result.edges.push(Edge::contains(repo_name.to_string(), rel_path.to_string()));
+        }
+
+        // Get or create tag extractor for this language
+        let mut extractor = match &self.queries_dir {
+            Some(dir) => TagExtractor::from_queries_dir(language, dir)?,
+            None => TagExtractor::from_embedded(language)?,
+        };
+        let metadata_extractor = MetadataExtractor::new(language);
+
+        // Extract tags
+        let tags = extractor.extract(&source)?;
+
+        // Separate definition and reference tags
+        let mut definition_tags: Vec<_> = tags
+            .iter()
+            .filter(|t| t.tag.starts_with("name.") && t.tag.contains(".definition."))
+            .collect();
+
+        let reference_tags: Vec<_> = tags
+            .iter()
+            .filter(|t| t.tag.starts_with("name.") && t.tag.contains(".reference."))
+            .collect();
+
+        // Sort definition tags by line for proper containment tracking
+        definition_tags.sort_by_key(|t| (t.start_line, t.end_line));
+
+        // Initialize containment context
+        let mut containment_ctx = ContainmentContext::new();
+
+        // Process definitions
+        for tag in &definition_tags {
+            // Parse tag type
+            let tag_string = normalize_tag_string(&tag.tag);
+            let tag_info = match parse_tag_string(&tag_string) {
+                Ok(info) => info,
+                Err(e) => {
+                    warn!(
+                        "Could not parse tag type '{}' in {}:{}: {}",
+                        tag.tag,
+                        rel_path,
+                        tag.line_number(),
+                        e
+                    );
+                    continue;
+                }
+            };
+
+            // Skip Data nodes if configured
+            if self.config.skip_data_nodes && tag_info.node_type == NodeType::Data {
+                result.skipped_data_nodes += 1;
+                continue;
+            }
+
+            // Update containment context
+            containment_ctx.update(tag.containment_start_line());
+
+            // Check max containment depth
+            if let Some(max_depth) = self.config.max_containment_depth {
+                let current_depth = containment_ctx.depth();
+                if current_depth >= max_depth {
+                    result.skipped_depth_nodes += 1;
+                    continue;
+                }
+            }
+
+            // Get containment path - special handling for Rust impl methods
+            let (containment_path, parent_id) = if let Some(impl_type) = &tag.impl_target {
+                let impl_type_id = format!("{}:{}", rel_path, impl_type);
+                (vec![impl_type.as_str()], impl_type_id)
+            } else {
+                let path = containment_ctx.get_containment_path();
+                let parent = containment_ctx
+                    .get_current_parent_id()
+                    .map(String::from)
+                    .unwrap_or_else(|| rel_path.to_string());
+                (path, parent)
+            };
+
+            // Skip self-referential containment
+            if containment_path.last() == Some(&tag.name.as_str()) {
+                continue;
+            }
+
+            // Generate node ID with kind suffix for disambiguation
+            let kind_str = tag_info.kind.as_ref().map(|k| k.as_str());
+            let node_id = generate_node_id(
+                rel_path,
+                &containment_path,
+                &tag.name,
+                kind_str,
+                None,
+            );
+
+            // Add to definitions dictionary
+            result.definitions.insert(tag.name.clone(), node_id.clone());
+
+            // Create node
+            let node = self.create_node_from_tag(
+                &node_id,
+                &tag.name,
+                &tag_info,
+                rel_path,
+                tag.line_number(),
+                tag.end_line_number(),
+                &metadata_extractor,
+            );
+
+            // Add node to result
+            result.nodes.push(node);
+
+            // Add CONTAINS edge from parent
+            result.edges.push(Edge::contains(parent_id.clone(), node_id.clone()));
+
+            // Add DEFINES edge for Data nodes (if parent is not the file)
+            if tag_info.node_type == NodeType::Data && parent_id != rel_path {
+                result.edges.push(Edge::defines(parent_id.clone(), node_id.clone()));
+            }
+
+            // Push containers onto containment stack
+            let node_type_str = tag_info.node_type.as_str();
+            if node_type_str == "Container" || node_type_str == "Callable" {
+                containment_ctx.push_container(
+                    node_id,
+                    node_type_str.to_string(),
+                    tag.containment_start_line(),
+                    tag.containment_end_line(),
+                    tag.name.clone(),
+                );
+            }
+        }
+
+        // Process references
+        for tag in &reference_tags {
+            let tag_string = normalize_tag_string(&tag.tag);
+            let _tag_info = match parse_tag_string(&tag_string) {
+                Ok(info) => info,
+                Err(_) => continue,
+            };
+
+            // Find source entity context
+            let source_id = self.find_enclosing_context(&definition_tags, tag.start_line, rel_path);
+
+            // Store reference
+            result.references
+                .entry(tag.name.clone())
+                .or_default()
+                .push(ReferenceInfo {
+                    source_id,
+                    line: tag.line_number(),
+                });
+        }
+
+        Ok(result)
     }
 
     /// Process a single file and add its entities to the graph.
