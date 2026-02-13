@@ -165,8 +165,6 @@ struct ReferenceInfo {
 /// Results from processing a single file in parallel.
 #[derive(Debug, Clone)]
 struct FileProcessingResult {
-    /// File path (relative to repository)
-    rel_path: String,
     /// Nodes extracted from this file
     nodes: Vec<Node>,
     /// Edges from this file (CONTAINS and DEFINES only)
@@ -182,9 +180,8 @@ struct FileProcessingResult {
 }
 
 impl FileProcessingResult {
-    fn new(rel_path: String) -> Self {
+    fn new() -> Self {
         Self {
-            rel_path,
             nodes: Vec::new(),
             edges: Vec::new(),
             definitions: HashMap::new(),
@@ -281,23 +278,6 @@ impl GraphBuilder {
         })
     }
 
-    /// Write status update to a file in the .codeprysm directory
-    fn write_status(&self, directory: &Path, step: &str, message: &str) -> std::io::Result<()> {
-        let status_dir = directory.join(".codeprysm").join("status");
-        std::fs::create_dir_all(&status_dir)?;
-
-        let timestamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
-
-        let filename = format!("{}_{}.txt", timestamp, step.replace(' ', "_"));
-        let status_file = status_dir.join(filename);
-
-        std::fs::write(status_file, format!("{}: {}\n", step, message))?;
-        Ok(())
-    }
-
     /// Build a code graph from a directory.
     ///
     /// Walks the directory, processes all supported source files in parallel, and
@@ -314,19 +294,18 @@ impl GraphBuilder {
     pub fn build_from_directory(&mut self, directory: &Path) -> Result<PetCodeGraph, BuilderError> {
         let mut graph = PetCodeGraph::new();
 
-        // Create Repository node as root of the hierarchy
+        // Step 1: Create Repository node as root of the hierarchy
         let repo_name = get_repo_name(directory);
         let (git_remote, git_branch, git_commit) = extract_git_metadata(directory);
         let repo_metadata = NodeMetadata::default().with_git(git_remote, git_branch, git_commit);
         let repo_node = Node::repository(repo_name.clone(), repo_metadata);
         graph.add_node(repo_node);
 
-        info!("Created repository node: {}", repo_name);
-        let _ = self.write_status(directory, "step_1_repo_created", &format!("Repository node: {}", repo_name));
+        info!("Step 1: Created repository node: {}", repo_name);
 
-        info!("Processing files in {}", directory.display());
+        // Step 2: Collect files to process
+        info!("Step 2: Collecting files in {}", directory.display());
 
-        // Collect files to process
         let files: Vec<PathBuf> = self.collect_files(directory)?;
 
         if files.is_empty() {
@@ -340,15 +319,10 @@ impl GraphBuilder {
             files
         };
 
-        info!("Found {} files to process", files_to_process.len());
-        let _ = self.write_status(
-            directory,
-            "step_2_files_collected",
-            &format!("Files to process: {}", files_to_process.len())
-        );
+        info!("Step 2: Found {} files to process", files_to_process.len());
 
-        // Process files in parallel
-        info!("Processing files in parallel...");
+        // Step 3: Process files in parallel
+        info!("Step 3: Processing files in parallel...");
         let start_time = std::time::Instant::now();
 
         let results: Vec<FileProcessingResult> = files_to_process
@@ -373,24 +347,14 @@ impl GraphBuilder {
 
         let processing_time = start_time.elapsed();
         info!(
-            "Parallel processing complete: {} files in {:.2}s ({:.1} files/sec)",
+            "Step 3: Parallel processing complete - {} files in {:.2}s ({:.1} files/sec)",
             results.len(),
             processing_time.as_secs_f64(),
             results.len() as f64 / processing_time.as_secs_f64()
         );
-        let _ = self.write_status(
-            directory,
-            "step_3_parallel_processing",
-            &format!(
-                "Processed {} files in {:.2}s ({:.1} files/sec)",
-                results.len(),
-                processing_time.as_secs_f64(),
-                results.len() as f64 / processing_time.as_secs_f64()
-            )
-        );
 
-        // Merge results into main graph
-        info!("Merging results into graph...");
+        // Step 4: Merge results into main graph
+        info!("Step 4: Merging results into graph...");
         let merge_start = std::time::Instant::now();
 
         let mut defines: HashMap<String, String> = HashMap::new();
@@ -431,41 +395,27 @@ impl GraphBuilder {
 
         let merge_time = merge_start.elapsed();
         info!(
-            "Merge complete: {} files in {:.2}s",
+            "Step 4: Merge complete - {} files with {} definitions, {} references in {:.2}s",
             file_count,
+            defines.len(),
+            references.len(),
             merge_time.as_secs_f64()
         );
-        let _ = self.write_status(
-            directory,
-            "step_4_merge_complete",
-            &format!(
-                "Merged {} files with {} definitions, {} references in {:.2}s",
-                file_count,
-                defines.len(),
-                references.len(),
-                merge_time.as_secs_f64()
-            )
-        );
 
-        // Resolve references and create USES edges
-        info!("Resolving references...");
+        // Step 5: Resolve references and create USES edges
+        info!("Step 5: Resolving references...");
         let resolve_start = std::time::Instant::now();
         self.resolve_references(&mut graph, &defines, &references);
         let resolve_time = resolve_start.elapsed();
 
-        info!("Reference resolution complete in {:.2}s", resolve_time.as_secs_f64());
-        let _ = self.write_status(
-            directory,
-            "step_5_references_resolved",
-            &format!("Resolved references in {:.2}s", resolve_time.as_secs_f64())
-        );
+        info!("Step 5: Reference resolution complete in {:.2}s", resolve_time.as_secs_f64());
 
-        // Log statistics
+        // Step 6: Log final statistics
         let contains_count = graph.edges_by_type(EdgeType::Contains).count();
         let uses_count = graph.edges_by_type(EdgeType::Uses).count();
         let defines_count = graph.edges_by_type(EdgeType::Defines).count();
 
-        info!("Graph summary:");
+        info!("Step 6: Graph summary:");
         info!("  - Nodes: {}", graph.node_count());
         info!("  - CONTAINS edges: {}", contains_count);
         info!("  - USES edges: {}", uses_count);
@@ -483,15 +433,13 @@ impl GraphBuilder {
         }
 
         let total_time = start_time.elapsed();
-        let final_summary = format!(
-            "Graph complete: {} nodes, {} edges, {} files in {:.2}s",
+        info!(
+            "Step 6: Graph complete - {} nodes, {} edges, {} files in {:.2}s (total)",
             graph.node_count(),
             graph.edge_count(),
             file_count,
             total_time.as_secs_f64()
         );
-        info!("{}", final_summary);
-        let _ = self.write_status(directory, "step_6_complete", &final_summary);
 
         Ok(graph)
     }
@@ -745,7 +693,7 @@ impl GraphBuilder {
         let line_count = source.lines().count();
 
         // Create result container
-        let mut result = FileProcessingResult::new(rel_path.to_string());
+        let mut result = FileProcessingResult::new();
 
         // Add file container node
         result.nodes.push(Node::source_file(

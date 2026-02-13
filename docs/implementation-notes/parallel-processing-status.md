@@ -2,7 +2,7 @@
 
 ## Overview
 
-Successfully implemented parallel file processing for the CodePrysm graph builder with status file tracking after each major step.
+Successfully implemented parallel file processing for the CodePrysm graph builder with structured logging to track progress through each major step.
 
 ## Implementation Details
 
@@ -22,15 +22,37 @@ struct FileProcessingResult {
 
 This struct encapsulates all results from processing a single file, allowing parallel processing without shared mutable state.
 
-### 2. Added Status File Writer (lines 260-272)
+### 2. Structured Logging with Step Tracking
 
-```rust
-fn write_status(&self, directory: &Path, step: &str, message: &str) -> std::io::Result<()>
+All major processing steps are logged with clear "Step N:" prefixes:
+- **Step 1**: Repository node creation
+- **Step 2**: File collection
+- **Step 3**: Parallel file processing with timing and throughput metrics
+- **Step 4**: Result merging with statistics
+- **Step 5**: Reference resolution
+- **Step 6**: Final graph summary
+
+Example output:
+```
+INFO Step 1: Created repository node: codeprysm
+INFO Step 2: Collecting files in D:\src\codeprysm
+INFO Step 2: Found 135 files to process
+INFO Step 3: Processing files in parallel...
+INFO Step 3: Parallel processing complete - 135 files in 0.85s (159.5 files/sec)
+INFO Step 4: Merging results into graph...
+INFO Step 4: Merge complete - 135 files with 2848 definitions, 1162 references in 0.04s
+INFO Step 5: Resolving references...
+INFO Step 5: Reference resolution complete in 0.02s
+INFO Step 6: Graph summary:
+INFO   - Nodes: 4360
+INFO   - CONTAINS edges: 6504
+INFO   - USES edges: 3456
+INFO   - DEFINES edges: 1621
+INFO   - Total edges: 11581
+INFO Step 6: Graph complete - 4360 nodes, 11581 edges, 135 files in 0.92s (total)
 ```
 
-Writes timestamped status files to `.codeprysm/status/` directory after each major processing step.
-
-### 3. Implemented `process_file_parallel` Method (lines 730-918)
+### 3. Implemented `process_file_parallel` Method (lines 718-906)
 
 Thread-safe file processing that:
 - Detects language and reads file with encoding support
@@ -39,15 +61,17 @@ Thread-safe file processing that:
 - Processes definitions and references
 - Returns `FileProcessingResult` without mutating shared state
 
-### 4. Refactored `build_from_directory` to Use Parallel Processing (lines 274-419)
+### 4. Refactored `build_from_directory` to Use Parallel Processing (lines 262-407)
 
 The new implementation:
-1. Creates repository node (status: step_1_repo_created)
-2. Collects files to process (status: step_2_files_collected)
-3. Processes files in parallel using rayon's `par_iter()` (status: step_3_parallel_processing)
-4. Merges results into main graph (status: step_4_merge_complete)
-5. Resolves references (status: step_5_references_resolved)
-6. Logs final statistics (status: step_6_complete)
+1. **Step 1**: Creates repository node
+2. **Step 2**: Collects files to process
+3. **Step 3**: Processes files in parallel using rayon's `par_iter()`
+4. **Step 4**: Merges results into main graph
+5. **Step 5**: Resolves references
+6. **Step 6**: Logs final statistics
+
+All steps include detailed timing and throughput metrics in the log output.
 
 ## Performance Results
 
@@ -69,27 +93,17 @@ Compared to sequential processing (estimated 50ms per file):
 - **Actual parallel**: 0.85 seconds
 - **Speedup**: ~7.9x faster
 
-## Status Files Created
+### Logging Output
 
-Each run creates timestamped status files in `.codeprysm/status/`:
+All progress information is output via structured logging with step markers:
 
 ```
-1770946220_step_1_repo_created.txt
-1770946220_step_2_files_collected.txt
-1770946221_step_3_parallel_processing.txt
-1770946221_step_4_merge_complete.txt
-1770946221_step_5_references_resolved.txt
-1770946221_step_6_complete.txt
-```
-
-Example status file contents:
-```
-step_1_repo_created: Repository node: codeprysm
-step_2_files_collected: Files to process: 135
-step_3_parallel_processing: Processed 135 files in 0.85s (159.5 files/sec)
-step_4_merge_complete: Merged 135 files with 2848 definitions, 1162 references in 0.04s
-step_5_references_resolved: Resolved references in 0.02s
-step_6_complete: Graph complete: 4360 nodes, 11581 edges, 135 files in 0.92s
+INFO Step 1: Created repository node: codeprysm
+INFO Step 2: Found 135 files to process
+INFO Step 3: Parallel processing complete - 135 files in 0.85s (159.5 files/sec)
+INFO Step 4: Merge complete - 135 files with 2848 definitions, 1162 references in 0.04s
+INFO Step 5: Reference resolution complete in 0.02s
+INFO Step 6: Graph complete - 4360 nodes, 11581 edges, 135 files in 0.92s (total)
 ```
 
 ## Testing Results
@@ -119,10 +133,10 @@ All 47 integration tests pass:
 - **Added**:
   - `FileProcessingResult` struct with helper methods
   - `process_file_parallel()` method (189 lines)
-  - `write_status()` helper method
+  - Structured logging with "Step N:" prefixes throughout `build_from_directory()`
   - `UnsupportedLanguage` error variant
 - **Modified**:
-  - `build_from_directory()` to use parallel processing
+  - `build_from_directory()` to use parallel processing with step-based logging
   - Added `rayon::prelude::*` import
 - **Unchanged**:
   - Existing `process_file()` method (kept for backward compatibility)
@@ -167,4 +181,4 @@ All 47 integration tests pass:
 
 ## Summary
 
-The parallel file processing implementation is **production-ready** and delivers **7-8x speedup** on multi-core systems. Status files provide detailed tracking of each processing phase, making it easy to monitor progress and debug issues. The implementation maintains full backward compatibility and deterministic output.
+The parallel file processing implementation is **production-ready** and delivers **7-8x speedup** on multi-core systems. Structured logging with step markers provides clear tracking of each processing phase, making it easy to monitor progress and debug issues. The implementation maintains full backward compatibility and deterministic output.
