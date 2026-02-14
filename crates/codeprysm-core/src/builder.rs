@@ -294,17 +294,17 @@ impl GraphBuilder {
     pub fn build_from_directory(&mut self, directory: &Path) -> Result<PetCodeGraph, BuilderError> {
         let mut graph = PetCodeGraph::new();
 
-        // Step 1: Create Repository node as root of the hierarchy
+        // Create Repository node as root of the hierarchy
         let repo_name = get_repo_name(directory);
         let (git_remote, git_branch, git_commit) = extract_git_metadata(directory);
         let repo_metadata = NodeMetadata::default().with_git(git_remote, git_branch, git_commit);
         let repo_node = Node::repository(repo_name.clone(), repo_metadata);
         graph.add_node(repo_node);
 
-        info!("Step 1: Created repository node: {}", repo_name);
+        info!("Created repository node: {}", repo_name);
 
-        // Step 2: Collect files to process
-        info!("Step 2: Collecting files in {}", directory.display());
+        // Collect files to process
+        info!("Collecting files in {}", directory.display());
 
         let files: Vec<PathBuf> = self.collect_files(directory)?;
 
@@ -319,10 +319,10 @@ impl GraphBuilder {
             files
         };
 
-        info!("Step 2: Found {} files to process", files_to_process.len());
+        info!("Found {} files to process", files_to_process.len());
 
-        // Step 3: Process files in parallel
-        info!("Step 3: Processing files in parallel...");
+        // Process files in parallel
+        info!("Processing files in parallel...");
         let start_time = std::time::Instant::now();
 
         let results: Vec<FileProcessingResult> = files_to_process
@@ -347,14 +347,14 @@ impl GraphBuilder {
 
         let processing_time = start_time.elapsed();
         info!(
-            "Step 3: Parallel processing complete - {} files in {:.2}s ({:.1} files/sec)",
+            "Parallel processing complete: {} files in {:.2}s ({:.1} files/sec)",
             results.len(),
             processing_time.as_secs_f64(),
             results.len() as f64 / processing_time.as_secs_f64()
         );
 
-        // Step 4: Merge results into main graph
-        info!("Step 4: Merging results into graph...");
+        // Merge results into main graph
+        info!("Merging results into graph...");
         let merge_start = std::time::Instant::now();
 
         let mut defines: HashMap<String, String> = HashMap::new();
@@ -395,27 +395,27 @@ impl GraphBuilder {
 
         let merge_time = merge_start.elapsed();
         info!(
-            "Step 4: Merge complete - {} files with {} definitions, {} references in {:.2}s",
+            "Merge complete: {} files with {} definitions, {} references in {:.2}s",
             file_count,
             defines.len(),
             references.len(),
             merge_time.as_secs_f64()
         );
 
-        // Step 5: Resolve references and create USES edges
-        info!("Step 5: Resolving references...");
+        // Resolve references and create USES edges
+        info!("Resolving references...");
         let resolve_start = std::time::Instant::now();
         self.resolve_references(&mut graph, &defines, &references);
         let resolve_time = resolve_start.elapsed();
 
-        info!("Step 5: Reference resolution complete in {:.2}s", resolve_time.as_secs_f64());
+        info!("Reference resolution complete in {:.2}s", resolve_time.as_secs_f64());
 
-        // Step 6: Log final statistics
+        // Log final statistics
         let contains_count = graph.edges_by_type(EdgeType::Contains).count();
         let uses_count = graph.edges_by_type(EdgeType::Uses).count();
         let defines_count = graph.edges_by_type(EdgeType::Defines).count();
 
-        info!("Step 6: Graph summary:");
+        info!("Graph summary:");
         info!("  - Nodes: {}", graph.node_count());
         info!("  - CONTAINS edges: {}", contains_count);
         info!("  - USES edges: {}", uses_count);
@@ -434,7 +434,7 @@ impl GraphBuilder {
 
         let total_time = start_time.elapsed();
         info!(
-            "Step 6: Graph complete - {} nodes, {} edges, {} files in {:.2}s (total)",
+            "Graph complete: {} nodes, {} edges, {} files in {:.2}s (total)",
             graph.node_count(),
             graph.edge_count(),
             file_count,
