@@ -24,7 +24,7 @@ use tracing::{debug, info, warn};
 
 use codeprysm_core::lazy::manager::LazyGraphManager;
 use codeprysm_core::{EdgeType, IncrementalUpdater, Node, PetCodeGraph};
-use codeprysm_search::{GraphIndexer, HybridSearcher, QdrantConfig};
+use codeprysm_search::{EmbeddingConfig, GraphIndexer, HybridSearcher, QdrantConfig};
 
 use crate::tools::*;
 
@@ -33,6 +33,54 @@ const STATE_LOCK_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Threshold for logging slow lock acquisition warnings
 const LOCK_WARN_THRESHOLD: Duration = Duration::from_millis(100);
+
+/// Detect which embedding provider to use based on compile-time features
+///
+/// Priority order:
+/// 1. ONNX DirectML (Windows GPU acceleration)
+/// 2. ONNX OpenVINO (Intel hardware acceleration)
+/// 3. ONNX CPU
+/// 4. Local Candle provider (default)
+#[allow(unreachable_code)]
+fn detect_embedding_config() -> EmbeddingConfig {
+    #[cfg(feature = "onnx-directml")]
+    {
+        info!("ONNX DirectML feature detected, using ONNX provider with DirectML");
+        // Set DirectML execution provider via environment variable
+        std::env::set_var("CODEPRYSM_ONNX_EXECUTION_PROVIDER", "directml");
+        return EmbeddingConfig::onnx();
+    }
+
+    #[cfg(all(feature = "onnx-openvino", not(feature = "onnx-directml")))]
+    {
+        info!("ONNX OpenVINO feature detected, using ONNX provider with OpenVINO");
+        // Set OpenVINO execution provider via environment variable
+        std::env::set_var("CODEPRYSM_ONNX_EXECUTION_PROVIDER", "openvino");
+        return EmbeddingConfig::onnx();
+    }
+
+    #[cfg(all(feature = "onnx", not(feature = "onnx-directml"), not(feature = "onnx-openvino")))]
+    {
+        info!("ONNX feature detected, using ONNX provider (CPU)");
+        return EmbeddingConfig::onnx();
+    }
+
+    // Default to Local (Candle-based)
+    #[cfg(all(not(feature = "onnx"), feature = "metal"))]
+    {
+        info!("Using Local provider with Metal GPU acceleration");
+    }
+    #[cfg(all(not(feature = "onnx"), feature = "cuda", not(feature = "metal")))]
+    {
+        info!("Using Local provider with CUDA GPU acceleration");
+    }
+    #[cfg(all(not(feature = "onnx"), not(feature = "metal"), not(feature = "cuda")))]
+    {
+        info!("Using Local provider (CPU)");
+    }
+
+    EmbeddingConfig::local()
+}
 
 /// Acquire a read lock on state with timeout and contention tracking.
 /// Read locks allow concurrent access and should be used for query operations.
@@ -359,29 +407,42 @@ impl PrismServer {
             stats.total_partitions, stats.loaded_partitions
         );
 
+        // Detect embedding configuration based on compile-time features
+        let embedding_config = detect_embedding_config();
+        info!(
+            "Using embedding provider: {:?}",
+            embedding_config.provider
+        );
+
         // Try to connect to search (optional - gracefully degrade if unavailable)
-        let searcher =
-            match HybridSearcher::connect(config.qdrant_config.clone(), &config.repo_id).await {
-                Ok(s) => {
-                    info!("Connected to Qdrant for hybrid search");
+        let searcher = match HybridSearcher::connect_from_config(
+            config.qdrant_config.clone(),
+            &embedding_config,
+            &config.repo_id,
+        )
+        .await
+        {
+            Ok(s) => {
+                info!("Connected to Qdrant for hybrid search");
 
-                    // Preload embedding models for faster first query
-                    info!("Preloading embedding models...");
-                    if let Err(e) = s.preload_models() {
-                        warn!("Failed to preload embedding models: {}", e);
-                    } else {
-                        info!("Embedding models preloaded successfully");
-                    }
+                // Preload embedding models for faster first query
+                info!("Preloading embedding models...");
+                if let Err(e) = s.preload_models() {
+                    warn!("Failed to preload embedding models: {}", e);
+                } else {
+                    info!("Embedding models preloaded successfully");
+                }
 
-                    // Index graph on startup if needed
-                    match GraphIndexer::new(
-                        config.qdrant_config.clone(),
-                        &config.repo_id,
-                        &config.repo_path,
-                    )
-                    .await
-                    {
-                        Ok(mut indexer) => {
+                // Index graph on startup if needed
+                match GraphIndexer::from_config(
+                    config.qdrant_config.clone(),
+                    &embedding_config,
+                    &config.repo_id,
+                    &config.repo_path,
+                )
+                .await
+                {
+                    Ok(mut indexer) => {
                             // Check if we need to index
                             match indexer.needs_indexing().await {
                                 Ok(true) | Err(_) => {
@@ -1725,7 +1786,11 @@ async fn background_sync_task(
         }
 
         // Create indexer and index
-        match GraphIndexer::new(qdrant_config, &repo_id, &repo_path).await {
+        // Use the same embedding config detection for consistency
+        let embedding_config = detect_embedding_config();
+        match GraphIndexer::from_config(qdrant_config, &embedding_config, &repo_id, &repo_path)
+            .await
+        {
             Ok(mut indexer) => {
                 let use_incremental =
                     !update_result.was_full_rebuild && update_result.changes.has_changes();

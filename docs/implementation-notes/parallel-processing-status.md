@@ -22,34 +22,34 @@ struct FileProcessingResult {
 
 This struct encapsulates all results from processing a single file, allowing parallel processing without shared mutable state.
 
-### 2. Structured Logging with Step Tracking
+### 2. Structured Logging with Progress Tracking
 
-All major processing steps are logged with clear "Step N:" prefixes:
-- **Step 1**: Repository node creation
-- **Step 2**: File collection
-- **Step 3**: Parallel file processing with timing and throughput metrics
-- **Step 4**: Result merging with statistics
-- **Step 5**: Reference resolution
-- **Step 6**: Final graph summary
+All major processing steps are logged with detailed timing and statistics:
+- Repository node creation
+- File collection
+- Parallel file processing with timing and throughput metrics
+- Result merging with statistics
+- Reference resolution
+- Final graph summary
 
 Example output:
 ```
-INFO Step 1: Created repository node: codeprysm
-INFO Step 2: Collecting files in D:\src\codeprysm
-INFO Step 2: Found 135 files to process
-INFO Step 3: Processing files in parallel...
-INFO Step 3: Parallel processing complete - 135 files in 0.85s (159.5 files/sec)
-INFO Step 4: Merging results into graph...
-INFO Step 4: Merge complete - 135 files with 2848 definitions, 1162 references in 0.04s
-INFO Step 5: Resolving references...
-INFO Step 5: Reference resolution complete in 0.02s
-INFO Step 6: Graph summary:
+INFO Created repository node: codeprysm
+INFO Collecting files in D:\src\codeprysm
+INFO Found 135 files to process
+INFO Processing files in parallel...
+INFO Parallel processing complete: 135 files in 0.85s (159.5 files/sec)
+INFO Merging results into graph...
+INFO Merge complete: 135 files with 2848 definitions, 1162 references in 0.04s
+INFO Resolving references...
+INFO Reference resolution complete in 0.02s
+INFO Graph summary:
 INFO   - Nodes: 4360
 INFO   - CONTAINS edges: 6504
 INFO   - USES edges: 3456
 INFO   - DEFINES edges: 1621
 INFO   - Total edges: 11581
-INFO Step 6: Graph complete - 4360 nodes, 11581 edges, 135 files in 0.92s (total)
+INFO Graph complete: 4360 nodes, 11581 edges, 135 files in 0.92s (total)
 ```
 
 ### 3. Implemented `process_file_parallel` Method (lines 718-906)
@@ -61,17 +61,17 @@ Thread-safe file processing that:
 - Processes definitions and references
 - Returns `FileProcessingResult` without mutating shared state
 
-### 4. Refactored `build_from_directory` to Use Parallel Processing (lines 262-407)
+### 4. Refactored `build_from_directory` to Use Parallel Processing (lines 258-403)
 
-The new implementation:
-1. **Step 1**: Creates repository node
-2. **Step 2**: Collects files to process
-3. **Step 3**: Processes files in parallel using rayon's `par_iter()`
-4. **Step 4**: Merges results into main graph
-5. **Step 5**: Resolves references
-6. **Step 6**: Logs final statistics
+The new implementation follows these phases:
+1. Creates repository node
+2. Collects files to process
+3. Processes files in parallel using rayon's `par_iter()`
+4. Merges results into main graph
+5. Resolves references
+6. Logs final statistics
 
-All steps include detailed timing and throughput metrics in the log output.
+All phases include detailed timing and throughput metrics in the log output.
 
 ## Performance Results
 
@@ -95,15 +95,15 @@ Compared to sequential processing (estimated 50ms per file):
 
 ### Logging Output
 
-All progress information is output via structured logging with step markers:
+All progress information is output via structured logging:
 
 ```
-INFO Step 1: Created repository node: codeprysm
-INFO Step 2: Found 135 files to process
-INFO Step 3: Parallel processing complete - 135 files in 0.85s (159.5 files/sec)
-INFO Step 4: Merge complete - 135 files with 2848 definitions, 1162 references in 0.04s
-INFO Step 5: Reference resolution complete in 0.02s
-INFO Step 6: Graph complete - 4360 nodes, 11581 edges, 135 files in 0.92s (total)
+INFO Created repository node: codeprysm
+INFO Found 135 files to process
+INFO Parallel processing complete: 135 files in 0.85s (159.5 files/sec)
+INFO Merge complete: 135 files with 2848 definitions, 1162 references in 0.04s
+INFO Reference resolution complete in 0.02s
+INFO Graph complete: 4360 nodes, 11581 edges, 135 files in 0.92s (total)
 ```
 
 ## Testing Results
@@ -133,10 +133,10 @@ All 47 integration tests pass:
 - **Added**:
   - `FileProcessingResult` struct with helper methods
   - `process_file_parallel()` method (189 lines)
-  - Structured logging with "Step N:" prefixes throughout `build_from_directory()`
+  - Detailed progress logging throughout `build_from_directory()`
   - `UnsupportedLanguage` error variant
 - **Modified**:
-  - `build_from_directory()` to use parallel processing with step-based logging
+  - `build_from_directory()` to use parallel processing with progress logging
   - Added `rayon::prelude::*` import
 - **Unchanged**:
   - Existing `process_file()` method (kept for backward compatibility)
@@ -181,4 +181,4 @@ All 47 integration tests pass:
 
 ## Summary
 
-The parallel file processing implementation is **production-ready** and delivers **7-8x speedup** on multi-core systems. Structured logging with step markers provides clear tracking of each processing phase, making it easy to monitor progress and debug issues. The implementation maintains full backward compatibility and deterministic output.
+The parallel file processing implementation is **production-ready** and delivers **7-8x speedup** on multi-core systems. Detailed progress logging provides clear tracking of each processing phase, making it easy to monitor progress and debug issues. The implementation maintains full backward compatibility and deterministic output.
